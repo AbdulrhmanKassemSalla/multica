@@ -168,7 +168,9 @@ type Session struct {
 	// transition time, independent of the best-effort transcript. Nil uses the
 	// daemon's message-based accounting. The timestamp gives completed tools a
 	// fresh idle budget even when their transcript message has not drained yet.
-	ToolActivity func() (int32, time.Time)
+	// The timestamp is an awakeclock reading (see package awakeclock), the same
+	// clock the idle watchdog measures, so host sleep never counts as silence.
+	ToolActivity func() (int32, time.Duration)
 	// InterruptBackgroundTools stops owned background tools at the daemon's
 	// tool watchdog boundary without cancelling the agent. True means at least
 	// one tool completed/was stopped and released from accounting; the watchdog
