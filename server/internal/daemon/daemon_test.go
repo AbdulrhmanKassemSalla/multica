@@ -564,6 +564,11 @@ func TestTaskMulticaEnvironmentIncludesPrivateConfigRoot(t *testing.T) {
 		"TMP":                          "/task/tmp",
 		"TEMP":                         "/task/tmp",
 	}
+	if runtime.GOOS == "windows" {
+		// Windows tasks inherit host TMP/TEMP; see TestTaskMulticaEnvironmentTempPolicy.
+		delete(want, "TMP")
+		delete(want, "TEMP")
+	}
 	if !maps.Equal(env, want) {
 		t.Fatalf("taskMulticaEnvironment() = %#v, want %#v", env, want)
 	}
