@@ -9921,18 +9921,39 @@ func idleWatchdogTickInterval(window time.Duration) time.Duration {
 //
 // Polling rate comes from idleWatchdogTickInterval, so a run is force-stopped
 // somewhere between its budget and budget + tick, never earlier.
+//
+// Budgets count awake time only: wall time spent with the host suspended is
+// credited back to lastActivityAt before each check (see hostSuspendDetector),
+// so closing a laptop lid does not force-stop every in-flight run on wake.
 func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools func() int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, interruptBackground func() bool, terminalObserved func() bool, taskLog *slog.Logger) {
+	d.runIdleWatchdogWithClock(agentCtx, window, toolWindow, lastActivityAt, inFlightTools, fired, firedThreshold, cancel, messages, interruptBackground, terminalObserved, taskLog, time.Now)
+}
+
+// runIdleWatchdogWithClock is runIdleWatchdog with the wall clock injected so
+// tests can simulate a host suspend (a wall-clock jump between two ticks).
+func (d *Daemon) runIdleWatchdogWithClock(agentCtx context.Context, window, toolWindow time.Duration, lastActivityAt *atomic.Int64, inFlightTools func() int32, fired *atomic.Bool, firedThreshold *atomic.Int64, cancel context.CancelFunc, messages <-chan agent.Message, interruptBackground func() bool, terminalObserved func() bool, taskLog *slog.Logger, now func() time.Time) {
 	tickWindow := window
 	if toolWindow > 0 && toolWindow < tickWindow {
 		tickWindow = toolWindow
 	}
-	ticker := time.NewTicker(idleWatchdogTickInterval(tickWindow))
+	tickInterval := idleWatchdogTickInterval(tickWindow)
+	ticker := time.NewTicker(tickInterval)
 	defer ticker.Stop()
+	suspend := newHostSuspendDetector(tickInterval, now())
 	for {
 		select {
 		case <-agentCtx.Done():
 			return
 		case <-ticker.C:
+			// Credit host sleep before anything reads the activity stamp —
+			// including the native tool callback below, which only moves the
+			// stamp forward and so cannot undo the credit.
+			tickAt := now()
+			if suspended := suspend.observe(tickAt); suspended > 0 {
+				creditSuspendedTime(lastActivityAt, suspended, tickAt)
+				taskLog.Info("idle watchdog: host suspend detected; not counting it as agent silence",
+					"suspended", suspended.Round(time.Second).String())
+			}
 			// Pick the silence budget. A tool in flight is expected to be
 			// silent (a long build/install/test emits nothing between
 			// tool_use and tool_result), so it gets the larger toolWindow;
@@ -9946,7 +9967,7 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 				threshold = toolWindow
 			}
 			last := time.Unix(0, lastActivityAt.Load())
-			idleFor := time.Since(last)
+			idleFor := now().Sub(last)
 			if idleFor < threshold {
 				continue
 			}
@@ -9966,7 +9987,7 @@ func (d *Daemon) runIdleWatchdog(agentCtx context.Context, window, toolWindow ti
 				return
 			}
 			if toolInFlight && interruptBackground != nil && interruptBackground() {
-				lastActivityAt.Store(time.Now().UnixNano())
+				lastActivityAt.Store(now().UnixNano())
 				taskLog.Info("tool watchdog stopped background tools; waiting for agent result")
 				continue
 			}
