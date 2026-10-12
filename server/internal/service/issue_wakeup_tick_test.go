@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
@@ -125,5 +126,78 @@ func TestWakeupTickDrainsBothLanesInOnePass(t *testing.T) {
 	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup WHERE workspace_id=$1 AND instruction='never' AND next_fire_at<=now()", f.WorkspaceID); n != 0 {
 		t.Fatalf("%d due checks were crowded out", n)
+	}
+}
+
+// Slow inputs must not starve due checks (PR #9202 review): dispatches
+// alternate between the lanes, and while due work remains the input lane
+// stops at its share of the pass budget.
+func TestWakeupTickSlowInputsLeaveTimeForDueChecks(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	ctx := context.Background()
+	ws := parseTestUUID(t, f.WorkspaceID)
+	idleConditionRules(t, f, s, agent, 40)
+	seed := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "noisy"})
+	f.Exec(t, "UPDATE issue_wakeup SET enabled=false, disabled_at=now() WHERE id=$1", seed.ID)
+	cloneWakeup(t, f, seed.ID, 9, true)
+	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload)
+		SELECT gen_random_uuid(),id,revision,'k','comment.created','{}' FROM issue_wakeup WHERE issue_id=$1`, issue)
+
+	// Ten inputs at 300ms each need 3s; the pass has 1.5s, a third of it for
+	// inputs while due checks remain.
+	slow := 0
+	err := s.tickWith(ctx, []pgtype.UUID{ws}, tickLimits{budget: 1500 * time.Millisecond, inputBudget: 500 * time.Millisecond,
+		beforeDispatch: func(w db.IssueWakeup) {
+			if w.Instruction == "noisy" {
+				slow++
+				time.Sleep(300 * time.Millisecond)
+			}
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup WHERE workspace_id=$1 AND instruction='never' AND next_fire_at<=now()", f.WorkspaceID); n != 0 {
+		t.Fatalf("%d due checks were starved by slow inputs", n)
+	}
+	if slow < 2 || slow >= 10 {
+		t.Fatalf("slow inputs dispatched = %d, want the pass to be cut short after at least 2", slow)
+	}
+	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id WHERE w.issue_id=$1 AND r.processed_at IS NULL", issue); n != 10-slow {
+		t.Fatalf("pending inputs = %d, want %d left for the next pass", n, 10-slow)
+	}
+}
+
+// Inputs a run holds on purpose are reported as held, not as backlog, so a
+// long-waiting run does not make every pass warn (PR #9202 review).
+func TestPendingWakeupInputsSeparatesHeldFromBacklog(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	ctx := context.Background()
+	ws := []pgtype.UUID{parseTestUUID(t, f.WorkspaceID)}
+	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "follow up"})
+	f.Comment(t, issue.String(), "hello")
+	f.Exec(t, "UPDATE issue_wakeup_receipt SET created_at=now()-interval '10 minutes' WHERE wakeup_id=$1", w.ID)
+	read := func() db.PendingWakeupInputsRow {
+		t.Helper()
+		p, err := f.q.PendingWakeupInputs(ctx, ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	p := read()
+	if age, ok := pendingInputAge(p, time.Now()); !ok || age < 9*time.Minute || p.Held != 0 {
+		t.Fatalf("unhandled input: age=%v ok=%v held=%d, want ~10m backlog", age, ok, p.Held)
+	}
+	// A queued run of the agent for the rule's creator will take the input.
+	run := f.Task(t, agent, testutil.Cols{"issue_id": issue.String(), "originator_user_id": f.UserID, "accountable_user_id": f.UserID,
+		"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
+	if p = read(); p.OldestReady.Valid || p.Held != 1 {
+		t.Fatalf("input waiting for a queued run: %+v, want held", p)
+	}
+	// An input a claim reserved stays held after the run leaves the queue.
+	f.Exec(t, "UPDATE agent_task_queue SET status='dispatched' WHERE id=$1", run)
+	f.Exec(t, "UPDATE issue_wakeup_receipt SET task_id=$2 WHERE wakeup_id=$1", w.ID, run)
+	if p = read(); p.OldestReady.Valid || p.Held != 1 {
+		t.Fatalf("reserved input: %+v, want held", p)
 	}
 }

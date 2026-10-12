@@ -95,10 +95,26 @@ SELECT w.* FROM candidates c JOIN issue_wakeup w ON w.id=c.id
 WHERE (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
   AND NOT (w.id = ANY(@skip_ids::uuid[]))
 ORDER BY w.updated_at,w.id LIMIT @row_limit;
--- name: OldestPendingWakeupReceipt :one
--- Scheduler observability: when the oldest still-unprocessed input arrived.
--- Inputs held for a run that has not started yet legitimately stay pending.
-SELECT min(created_at)::timestamptz AS oldest FROM issue_wakeup_receipt WHERE processed_at IS NULL;
+-- name: PendingWakeupInputs :one
+-- Scheduler observability over unprocessed inputs. Dispatch deliberately
+-- keeps some pending while a run holds them: inputs a claim reserved
+-- (task_id), inputs of a rule whose own run is claimed, and inputs waiting to
+-- join a queued run of the rule's agent on the issue (hasWaitingRun; for
+-- platform rules any queued run on the issue counts). Those are counted as
+-- held; the oldest of the rest is backlog the scheduler has not reached.
+WITH pending AS (
+ SELECT r.created_at,
+  (r.task_id IS NOT NULL
+   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')
+   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
+    AND (w.system_rule IS NOT NULL OR (t.agent_id=w.agent_id AND t.originator_user_id=w.created_by)))) AS held
+ FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+ WHERE r.processed_at IS NULL
+  AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
+)
+SELECT (min(created_at) FILTER (WHERE NOT held))::timestamptz AS oldest_ready,
+       count(*) FILTER (WHERE held)::int AS held
+FROM pending;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 

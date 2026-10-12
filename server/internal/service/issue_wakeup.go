@@ -669,22 +669,45 @@ func (s *IssueWakeupService) TickWorkspaces(ctx context.Context, workspaceIDs ..
 // tick to the other jobs; one dispatch is itself capped at 2s.
 const (
 	wakeupTickBatch = 100
-	// At most this many rules of a batch come from the input lane, so the due
-	// lane (schedules, deadlines, condition checks) always gets the rest of
-	// every batch and a steady event stream cannot starve it.
+	// At most this many rules of a batch come from the input lane; the due
+	// lane fetches the rest.
 	wakeupTickInputShare = 50
 	wakeupTickBudget     = 15 * time.Second
-	wakeupTickMaxRules   = 1500
-	// A pending input older than this is logged as a warning.
+	// While the due lane still has work, the input lane may spend at most
+	// this much of the pass, so slow inputs cannot starve schedules,
+	// deadlines and condition checks. Either lane uses the whole budget once
+	// the other is drained.
+	wakeupTickInputBudget = wakeupTickBudget / 2
+	wakeupTickMaxRules    = 1500
+	// A pending input the scheduler could act on that is older than this is
+	// logged as a warning. Inputs a run holds are reported separately.
 	wakeupPendingWarnAge = 2 * time.Minute
 )
 
+// tickLimits are a pass's limits; zero fields take the defaults above. Tests
+// shrink them, and beforeDispatch lets a test make a dispatch slow.
+type tickLimits struct {
+	budget, inputBudget time.Duration
+	beforeDispatch      func(db.IssueWakeup)
+}
+
 // tick dispatches ready wakeups; nil workspaceIDs means every workspace.
 //
-// Two lanes feed each batch: rules with unprocessed inputs (an event, a
+// Two lanes feed the pass: rules with unprocessed inputs (an event, a
 // condition hint, "wake now") and rules whose schedule, deadline or condition
-// check is due. Each rule is visited at most once per pass.
+// check is due. Dispatches alternate between the lanes, and the input lane's
+// time is capped while due work remains. Each rule is visited at most once.
 func (s *IssueWakeupService) tick(ctx context.Context, workspaceIDs []pgtype.UUID) error {
+	return s.tickWith(ctx, workspaceIDs, tickLimits{})
+}
+
+func (s *IssueWakeupService) tickWith(ctx context.Context, workspaceIDs []pgtype.UUID, lim tickLimits) error {
+	if lim.budget <= 0 {
+		lim.budget = wakeupTickBudget
+	}
+	if lim.inputBudget <= 0 {
+		lim.inputBudget = wakeupTickInputBudget
+	}
 	start := time.Now()
 	// Receipts are operational evidence, not the run history. Match the existing
 	// event telemetry's seven-day retention; never expire unprocessed inputs.
@@ -695,59 +718,88 @@ func (s *IssueWakeupService) tick(ctx context.Context, workspaceIDs []pgtype.UUI
 	if cleanupErr != nil {
 		errs = append(errs, fmt.Errorf("expire wakeup receipts: %w", cleanupErr))
 	}
-	// Never nil: "id = ANY(NULL)" is NULL and would exclude every rule.
-	visited := []pgtype.UUID{}
+	// claimed holds every rule visited or queued in this pass. Never nil:
+	// "id = ANY(NULL)" is NULL and would exclude every rule.
+	claimed := []pgtype.UUID{}
+	var inputQ, dueQ []db.IssueWakeup
+	inputDrained, dueDrained := false, false
+	var inputSpent time.Duration
 	inputs, due := 0, 0
 	stop := "drained"
-	exhausted := func() bool {
-		switch {
-		case len(visited) >= wakeupTickMaxRules:
-			stop = "rule_cap"
-		case time.Since(start) >= wakeupTickBudget:
+	inputTurn := true
+	for {
+		if ctx.Err() != nil {
+			return errors.Join(append(errs, ctx.Err())...)
+		}
+		if time.Since(start) >= lim.budget {
 			stop = "time_budget"
-		default:
-			return false
-		}
-		return true
-	}
-batches:
-	for !exhausted() {
-		room := min(wakeupTickBatch, wakeupTickMaxRules-len(visited))
-		inputLimit := min(wakeupTickInputShare, room)
-		inputRows, err := s.Tasks.Queries.ListInputWakeups(ctx, db.ListInputWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: visited, RowLimit: int32(inputLimit)})
-		if err != nil {
-			return errors.Join(append(errs, err)...)
-		}
-		// Exclude this batch's input rules from the due lane as well.
-		batchSkip := slices.Clone(visited)
-		for _, w := range inputRows {
-			batchSkip = append(batchSkip, w.ID)
-		}
-		dueLimit := room - len(inputRows)
-		dueRows, err := s.Tasks.Queries.ListDueWakeups(ctx, db.ListDueWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: batchSkip, RowLimit: int32(dueLimit)})
-		if err != nil {
-			return errors.Join(append(errs, err)...)
-		}
-		batch := append(inputRows, dueRows...)
-		for i, w := range batch {
-			if ctx.Err() != nil {
-				return errors.Join(append(errs, ctx.Err())...)
-			}
-			if exhausted() {
-				break batches
-			}
-			visited = append(visited, w.ID)
-			if i < len(inputRows) {
-				inputs++
-			} else {
-				due++
-			}
-			errs = append(errs, s.dispatchFromTick(ctx, w)...)
-		}
-		if len(inputRows) < inputLimit && len(dueRows) < dueLimit {
 			break
 		}
+		if inputs+due >= wakeupTickMaxRules {
+			stop = "rule_cap"
+			break
+		}
+		room := wakeupTickMaxRules - len(claimed)
+		if len(inputQ) == 0 && !inputDrained && room > 0 {
+			limit := min(wakeupTickInputShare, room)
+			rows, err := s.Tasks.Queries.ListInputWakeups(ctx, db.ListInputWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: claimed, RowLimit: int32(limit)})
+			if err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+			inputDrained = len(rows) < limit
+			inputQ = rows
+			for _, w := range rows {
+				claimed = append(claimed, w.ID)
+			}
+			room -= len(rows)
+		}
+		if len(dueQ) == 0 && !dueDrained && room > 0 {
+			limit := min(wakeupTickBatch-len(inputQ), room)
+			rows, err := s.Tasks.Queries.ListDueWakeups(ctx, db.ListDueWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: claimed, RowLimit: int32(limit)})
+			if err != nil {
+				return errors.Join(append(errs, err)...)
+			}
+			dueDrained = len(rows) < limit
+			dueQ = rows
+			for _, w := range rows {
+				claimed = append(claimed, w.ID)
+			}
+		}
+		// Due work is left while the lane has queued rules or can still fetch.
+		dueLeft := len(dueQ) > 0 || (!dueDrained && wakeupTickMaxRules > len(claimed))
+		inputAllowed := len(inputQ) > 0 && (inputSpent < lim.inputBudget || !dueLeft)
+		var w db.IssueWakeup
+		fromInput := false
+		switch {
+		case inputAllowed && (inputTurn || len(dueQ) == 0):
+			w, inputQ, fromInput = inputQ[0], inputQ[1:], true
+		case len(dueQ) > 0:
+			w, dueQ = dueQ[0], dueQ[1:]
+		default:
+			// Both lanes are empty: drained, or out of room under the cap.
+			if !inputDrained || !dueDrained {
+				stop = "rule_cap"
+			}
+			return s.finishTick(ctx, workspaceIDs, start, inputs, due, stop, errs)
+		}
+		inputTurn = !fromInput
+		began := time.Now()
+		if lim.beforeDispatch != nil {
+			lim.beforeDispatch(w)
+		}
+		errs = append(errs, s.dispatchFromTick(ctx, w)...)
+		if fromInput {
+			inputs++
+			inputSpent += time.Since(began)
+		} else {
+			due++
+		}
 	}
+	return s.finishTick(ctx, workspaceIDs, start, inputs, due, stop, errs)
+}
+
+// finishTick logs a global pass and returns its errors.
+func (s *IssueWakeupService) finishTick(ctx context.Context, workspaceIDs []pgtype.UUID, start time.Time, inputs, due int, stop string, errs []error) error {
 	if workspaceIDs == nil {
 		s.logTick(ctx, start, inputs, due, stop, len(errs))
 	}
@@ -781,9 +833,10 @@ func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWak
 }
 
 // logTick reports one global pass: how many rules each lane visited, how long
-// the pass took, why it stopped, and how old the oldest input still pending
-// is. A pass cut short by a limit, or an input waiting longer than
-// wakeupPendingWarnAge, logs at warn level.
+// the pass took and why it stopped, plus the age of the oldest input the
+// scheduler could act on and how many inputs a run is holding. A pass cut
+// short by a limit, or an actionable input waiting longer than
+// wakeupPendingWarnAge, logs at warn level; held inputs never do.
 func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, inputs, due int, stop string, failures int) {
 	attrs := []any{"input_rules", inputs, "due_rules", due, "duration_ms", time.Since(start).Milliseconds(), "stopped", stop, "failures", failures}
 	level := slog.LevelInfo
@@ -791,16 +844,27 @@ func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, input
 		level = slog.LevelWarn
 	}
 	ageCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	oldest, err := s.Tasks.Queries.OldestPendingWakeupReceipt(ageCtx)
+	pending, err := s.Tasks.Queries.PendingWakeupInputs(ageCtx, nil)
 	cancel()
-	if err == nil && oldest.Valid {
-		age := time.Since(oldest.Time)
-		attrs = append(attrs, "oldest_pending_input_age_s", int64(age.Seconds()))
-		if age > wakeupPendingWarnAge {
-			level = slog.LevelWarn
+	if err == nil {
+		attrs = append(attrs, "held_inputs", pending.Held)
+		if age, ok := pendingInputAge(pending, time.Now()); ok {
+			attrs = append(attrs, "oldest_ready_input_age_s", int64(age.Seconds()))
+			if age > wakeupPendingWarnAge {
+				level = slog.LevelWarn
+			}
 		}
 	}
 	slog.Log(ctx, level, "issue wakeup dispatch pass", attrs...)
+}
+
+// pendingInputAge is how long the oldest input the scheduler could act on has
+// waited, if there is one.
+func pendingInputAge(p db.PendingWakeupInputsRow, now time.Time) (time.Duration, bool) {
+	if !p.OldestReady.Valid {
+		return 0, false
+	}
+	return now.Sub(p.OldestReady.Time), true
 }
 
 func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) error {

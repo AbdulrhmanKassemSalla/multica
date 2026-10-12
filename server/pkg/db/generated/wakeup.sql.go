@@ -1591,19 +1591,6 @@ func (q *Queries) NoteWakeupFailure(ctx context.Context, arg NoteWakeupFailurePa
 	return err
 }
 
-const oldestPendingWakeupReceipt = `-- name: OldestPendingWakeupReceipt :one
-SELECT min(created_at)::timestamptz AS oldest FROM issue_wakeup_receipt WHERE processed_at IS NULL
-`
-
-// Scheduler observability: when the oldest still-unprocessed input arrived.
-// Inputs held for a run that has not started yet legitimately stay pending.
-func (q *Queries) OldestPendingWakeupReceipt(ctx context.Context) (pgtype.Timestamptz, error) {
-	row := q.db.QueryRow(ctx, oldestPendingWakeupReceipt)
-	var oldest pgtype.Timestamptz
-	err := row.Scan(&oldest)
-	return oldest, err
-}
-
 const pauseIssueWakeup = `-- name: PauseIssueWakeup :exec
 UPDATE issue_wakeup SET enabled=false,next_fire_at=NULL,paused_reason= $1,
  disabled_at=CASE WHEN $2::bool THEN COALESCE(disabled_at,clock_timestamp()) ELSE disabled_at END,
@@ -1622,6 +1609,40 @@ type PauseIssueWakeupParams struct {
 func (q *Queries) PauseIssueWakeup(ctx context.Context, arg PauseIssueWakeupParams) error {
 	_, err := q.db.Exec(ctx, pauseIssueWakeup, arg.PausedReason, arg.BlockRuns, arg.ID)
 	return err
+}
+
+const pendingWakeupInputs = `-- name: PendingWakeupInputs :one
+WITH pending AS (
+ SELECT r.created_at,
+  (r.task_id IS NOT NULL
+   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')
+   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
+    AND (w.system_rule IS NOT NULL OR (t.agent_id=w.agent_id AND t.originator_user_id=w.created_by)))) AS held
+ FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+ WHERE r.processed_at IS NULL
+  AND ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
+)
+SELECT (min(created_at) FILTER (WHERE NOT held))::timestamptz AS oldest_ready,
+       count(*) FILTER (WHERE held)::int AS held
+FROM pending
+`
+
+type PendingWakeupInputsRow struct {
+	OldestReady pgtype.Timestamptz `json:"oldest_ready"`
+	Held        int32              `json:"held"`
+}
+
+// Scheduler observability over unprocessed inputs. Dispatch deliberately
+// keeps some pending while a run holds them: inputs a claim reserved
+// (task_id), inputs of a rule whose own run is claimed, and inputs waiting to
+// join a queued run of the rule's agent on the issue (hasWaitingRun; for
+// platform rules any queued run on the issue counts). Those are counted as
+// held; the oldest of the rest is backlog the scheduler has not reached.
+func (q *Queries) PendingWakeupInputs(ctx context.Context, workspaceIds []pgtype.UUID) (PendingWakeupInputsRow, error) {
+	row := q.db.QueryRow(ctx, pendingWakeupInputs, workspaceIds)
+	var i PendingWakeupInputsRow
+	err := row.Scan(&i.OldestReady, &i.Held)
+	return i, err
 }
 
 const recordWakeupReceipt = `-- name: RecordWakeupReceipt :one
