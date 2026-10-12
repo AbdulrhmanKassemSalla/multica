@@ -297,7 +297,7 @@ export function WorkflowEditorPage({
             readOnly={!canEdit}
             placeholder={t(($) => $.workflows.editor.name_placeholder)}
             onChange={(e) => setDraft((d) => ({ ...d, name: e.target.value }))}
-            className="w-full bg-transparent text-title-lg font-semibold tracking-tight outline-none placeholder:text-muted-foreground/60"
+            className="w-full bg-transparent text-title-lg font-semibold tracking-tight outline-none placeholder:text-muted-foreground"
           />
           <input
             aria-label={t(($) => $.workflows.editor.description)}
@@ -306,7 +306,7 @@ export function WorkflowEditorPage({
             readOnly={!canEdit}
             placeholder={canEdit ? t(($) => $.workflows.editor.description_placeholder) : ""}
             onChange={(e) => setDraft((d) => ({ ...d, description: e.target.value }))}
-            className="w-full bg-transparent text-body text-muted-foreground outline-none placeholder:text-muted-foreground/50"
+            className="w-full bg-transparent text-body text-muted-foreground outline-none placeholder:text-muted-foreground"
           />
           <p className="text-body text-muted-foreground">
             {usedBy.length > 0
@@ -530,7 +530,7 @@ function StepCard({
         <button
           type="button"
           aria-label={t(($) => $.workflows.editor.reorder, { name: label })}
-          className="mt-0.5 flex size-5 shrink-0 touch-none items-center justify-center rounded cursor-grab text-muted-foreground active:cursor-grabbing"
+          className="mt-0.5 flex size-5 shrink-0 touch-none items-center justify-center rounded-xs cursor-grab text-muted-foreground active:cursor-grabbing"
           {...attributes}
           {...listeners}
         >
@@ -550,7 +550,7 @@ function StepCard({
           />
           <span className="truncate text-body font-medium">{label}</span>
           {initial && (
-            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
+            <span className="shrink-0 rounded-xs bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
               {t(($) => $.workflows.editor.start)}
             </span>
           )}
@@ -566,7 +566,7 @@ function StepCard({
               <span className="truncate">{handler}</span>
               {step.next_status_key && (
                 <>
-                  <span aria-hidden className="text-muted-foreground/50">·</span>
+                  <span aria-hidden className="text-muted-foreground">·</span>
                   <span className="shrink-0">
                     {t(($) => $.workflows.editor.card_then, { status: labelOf(step.next_status_key) })}
                   </span>

@@ -48,6 +48,7 @@ export function PullRequestsSection({
   // Older backends have no link / auto-complete endpoints; keep the header
   // actions hidden until the server says it supports them.
   const supported = !!data?.auto_complete;
+  const count = data?.pull_requests.length ?? 0;
 
   return (
     <div>
@@ -60,6 +61,11 @@ export function PullRequestsSection({
           onClick={() => onOpenChange(!open)}
         >
           <span className="truncate">{t(($) => $.detail.section_pull_requests)}</span>
+          {count > 0 ? (
+            <span className="shrink-0 rounded-xs bg-muted px-1 text-micro font-medium tabular-nums text-muted-foreground">
+              {count}
+            </span>
+          ) : null}
           <ChevronRight className={`!size-3 shrink-0 stroke-[2.5] text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
         </button>
         {supported ? (
@@ -227,7 +233,7 @@ function AutoCompleteMenu({
             <DropdownMenuSeparator />
           </>
         ) : null}
-        <DropdownMenuItem onClick={() => navigation.push(`${paths.settings()}?tab=integrations&integration=github`)}>
+        <DropdownMenuItem onClick={() => navigation.push(`${paths.settings()}?tab=code`)}>
           <Settings />
           {t(($) => $.pr_automation.settings)}
         </DropdownMenuItem>

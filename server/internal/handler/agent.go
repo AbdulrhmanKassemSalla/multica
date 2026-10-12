@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -537,6 +538,8 @@ type AgentTaskResponse struct {
 	QuickCreateAttachmentIDs []string             `json:"quick_create_attachment_ids,omitempty"` // attachment ids uploaded in the quick-create prompt and bound on issue create
 	QuickCreateSourceContext json.RawMessage      `json:"quick_create_source_context,omitempty"` // immutable historical context for source-context quick-create
 	WakeupID                 string               `json:"wakeup_id,omitempty"`
+	WakeupSystemRule         string               `json:"wakeup_system_rule,omitempty"`      // set when a platform rule (e.g. child_done) started the run
+	WakeupJoined             string               `json:"wakeup_joined,omitempty"`           // wakeups that fired while this run waited to start and joined it instead of queuing their own
 	HandoffNote              string               `json:"handoff_note,omitempty"`            // legacy assignment handoff instruction retained for installed clients; rendered by the daemon only in the per-turn prompt
 	SquadID                  string               `json:"squad_id,omitempty"`                // for quick-create tasks where the picker was a squad; Agent is still the resolved leader
 	SquadName                string               `json:"squad_name,omitempty"`              // display name for the picker squad
@@ -803,6 +806,7 @@ type TaskAgentData struct {
 // Dispatch only begins preparation, so a fallback cancelled before StartTask
 // is still unused. Keep started fallbacks and ordinary cancellations visible,
 // and retain the underlying scheduling records for audit.
+// Keep this predicate in sync with ListAgentTasks in pkg/db/queries/agent.sql.
 func visibleTaskHistory(tasks []db.AgentTaskQueue) []db.AgentTaskQueue {
 	return slices.DeleteFunc(tasks, func(task db.AgentTaskQueue) bool {
 		return task.EscalationForTaskID.Valid &&
@@ -843,7 +847,8 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		branchName = t.BranchName.String
 	}
 	var wakeupContext struct {
-		ID string `json:"wakeup_id"`
+		ID         string `json:"wakeup_id"`
+		SystemRule string `json:"wakeup_system"`
 	}
 	_ = json.Unmarshal(t.Context, &wakeupContext)
 	handoffNote := ""
@@ -880,6 +885,8 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		TriggerSummary:         textToPtr(t.TriggerSummary),
 		HandoffNote:            handoffNote,
 		WakeupID:               wakeupContext.ID,
+		WakeupSystemRule:       wakeupContext.SystemRule,
+		WakeupJoined:           service.JoinedWakeupNotes(t.Context),
 		WorkDir:                workDir,
 		RelativeWorkDir:        relativeWorkDir(workDir, workspaceID, uuidToString(t.ID)),
 		DurableWorkDir:         durableWorkDir,
@@ -1618,7 +1625,7 @@ func (h *Handler) CreateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Warn("create agent failed", append(logger.RequestAttrs(r), "error", err, "workspace_id", workspaceID)...)
-		writeError(w, http.StatusInternalServerError, "failed to create agent: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to create agent")
 		return
 	}
 	if err := replaceInvocationTargetsWithQueries(r.Context(), qtx, created.ID, parseUUID(ownerID), perm.targets); err != nil {
@@ -2269,7 +2276,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		slog.Warn("update agent failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-		writeError(w, http.StatusInternalServerError, "failed to update agent: "+err.Error())
+		writeError(w, http.StatusInternalServerError, "failed to update agent")
 		return
 	}
 
@@ -2280,7 +2287,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.Queries.ClearAgentMcpConfig(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent mcp_config failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-			writeError(w, http.StatusInternalServerError, "failed to clear mcp_config: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to clear mcp_config")
 			return
 		}
 	}
@@ -2288,7 +2295,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.Queries.ClearAgentThinkingLevel(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent thinking_level failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-			writeError(w, http.StatusInternalServerError, "failed to clear thinking_level: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to clear thinking_level")
 			return
 		}
 	}
@@ -2296,7 +2303,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.Queries.ClearAgentServiceTier(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent service_tier failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-			writeError(w, http.StatusInternalServerError, "failed to clear service_tier: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to clear service_tier")
 			return
 		}
 	}
@@ -2304,7 +2311,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 		updated, err = h.Queries.ClearAgentComposioToolkitAllowlist(r.Context(), updated.ID)
 		if err != nil {
 			slog.Warn("clear agent composio_toolkit_allowlist failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-			writeError(w, http.StatusInternalServerError, "failed to clear composio_toolkit_allowlist: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to clear composio_toolkit_allowlist")
 			return
 		}
 	}
@@ -2315,7 +2322,7 @@ func (h *Handler) UpdateAgent(w http.ResponseWriter, r *http.Request) {
 	if replacePermissionTargets {
 		if err := h.replaceInvocationTargets(r.Context(), updated.ID, parseUUID(requestUserID(r)), resolvedPerm.targets); err != nil {
 			slog.Warn("update agent: persist invocation targets failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
-			writeError(w, http.StatusInternalServerError, "failed to update invocation targets: "+err.Error())
+			writeError(w, http.StatusInternalServerError, "failed to update invocation targets")
 			return
 		}
 	}
@@ -2693,6 +2700,13 @@ func (h *Handler) CancelAgentTasks(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cancelAgentTasksResponse{Cancelled: len(cancelled)})
 }
 
+// HeaderAgentTasksNextCursor preserves the array response used by installed clients.
+// An absent header means this is the last page.
+const HeaderAgentTasksNextCursor = "X-Agent-Tasks-Next-Cursor"
+
+const defaultAgentTasksLimit = 200
+const maxAgentTasksLimit = 200
+
 func (h *Handler) ListAgentTasks(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	agent, ok := h.loadAgentForUser(w, r, id)
@@ -2718,13 +2732,41 @@ func (h *Handler) ListAgentTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tasks, err := h.Queries.ListAgentTasks(r.Context(), agent.ID)
+	limit := defaultAgentTasksLimit
+	if raw := r.URL.Query().Get("limit"); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = min(n, maxAgentTasksLimit)
+	}
+	// An infinite upper bound gives both first and subsequent pages an indexed
+	// tuple comparison, without an optional-cursor OR in the query plan.
+	beforeCreatedAt := pgtype.Timestamptz{InfinityModifier: pgtype.Infinity, Valid: true}
+	beforeID := agent.ID
+	if raw := r.URL.Query().Get("before"); raw != "" {
+		beforeCreatedAt, beforeID = parseTranscriptCursor(raw)
+		if !beforeCreatedAt.Valid || !beforeID.Valid {
+			writeError(w, http.StatusBadRequest, "invalid before cursor")
+			return
+		}
+	}
+	tasks, err := h.Queries.ListAgentTasks(r.Context(), db.ListAgentTasksParams{
+		AgentID: agent.ID, BeforeCreatedAt: beforeCreatedAt, BeforeID: beforeID,
+		PageLimit: int32(limit + 1),
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list agent tasks")
 		return
 	}
 
-	tasks = visibleTaskHistory(tasks)
+	nextCursor := ""
+	if len(tasks) > limit {
+		tasks = tasks[:limit]
+		last := tasks[len(tasks)-1]
+		nextCursor = transcriptCursor(last.CreatedAt.Time, last.ID)
+	}
 	resp := make([]AgentTaskResponse, len(tasks))
 	var taskIDs []pgtype.UUID
 	if includeUsage {
@@ -2746,18 +2788,23 @@ func (h *Handler) ListAgentTasks(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if nextCursor != "" {
+		w.Header().Set(HeaderAgentTasksNextCursor, nextCursor)
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
 // AgentActivityBucket is one day-bucketed throughput sample for the
 // Agents-list ACTIVITY sparkline. bucket_at is midnight UTC of the day.
 type AgentActivityBucket struct {
-	AgentID        string `json:"agent_id"`
-	BucketAt       string `json:"bucket_at"`
-	TaskCount      int32  `json:"task_count"`
-	FailedCount    int32  `json:"failed_count"`
-	CompletedCount int32  `json:"completed_count"`
-	CancelledCount int32  `json:"cancelled_count"`
+	AgentID        string  `json:"agent_id"`
+	BucketAt       string  `json:"bucket_at"`
+	TaskCount      int32   `json:"task_count"`
+	FailedCount    int32   `json:"failed_count"`
+	CompletedCount int32   `json:"completed_count"`
+	CancelledCount int32   `json:"cancelled_count"`
+	DurationMs     float64 `json:"duration_ms"`
+	DurationCount  int32   `json:"duration_count"`
 }
 
 // AgentRunCount is the trailing-30-day total task run count per agent,
@@ -2979,6 +3026,8 @@ func (h *Handler) GetWorkspaceAgentActivity30d(w http.ResponseWriter, r *http.Re
 			FailedCount:    row.FailedCount,
 			CompletedCount: row.CompletedCount,
 			CancelledCount: row.CancelledCount,
+			DurationMs:     row.DurationMs,
+			DurationCount:  row.DurationCount,
 		})
 	}
 

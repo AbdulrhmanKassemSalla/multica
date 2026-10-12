@@ -151,7 +151,7 @@ function DefaultWorkflowRow({ projects }: { projects: Project[] }) {
       <div className="min-w-0 flex-1 space-y-2">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-body font-semibold">{t(($) => $.workflows.default_name)}</span>
-          <span className="rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
+          <span className="rounded-xs bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
             {t(($) => $.workflows.settings.workspace_default)}
           </span>
           <RowMeta statuses={keys.length} handoffs={0} />

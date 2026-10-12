@@ -159,7 +159,7 @@ export function WorkflowHandoffConfirmDialog({
             {status(toStatus)}
             {preview?.workflow_name && (
               <>
-                <span aria-hidden className="text-muted-foreground/50">·</span>
+                <span aria-hidden className="text-muted-foreground">·</span>
                 <span>{preview.workflow_name}</span>
               </>
             )}

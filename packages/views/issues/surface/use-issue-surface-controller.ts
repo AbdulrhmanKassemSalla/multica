@@ -129,6 +129,9 @@ export interface IssueSurfaceController {
   isStatusCatalogError: boolean;
   /** Re-runs the failed catalog request behind {@link isStatusCatalogError}. */
   retryStatusCatalog: () => void;
+  /** First-load failure while the working filter needs issue membership. */
+  isWorkingFilterError: boolean;
+  retryWorkingFilter: () => void;
   openCreateIssue: (defaults?: IssueCreateDefaults) => void;
   moveIssue: (
     issueId: string,
@@ -419,9 +422,19 @@ export function useIssueSurfaceController({
         ? "any"
         : scope.relation
       : undefined;
-  const { data: workspaceWorkingAgents = EMPTY_LIST } = useQuery(
-    workspaceWorkingAgentsOptions(wsId, "issue", workingAgentMineRelation),
-  );
+  const workingAgentsProjection = useQuery({
+    ...workspaceWorkingAgentsOptions(wsId, "issue", workingAgentMineRelation),
+    // Ordinary surfaces get their chip count from the scoped facet. Only an
+    // active working filter or Gantt's canvas count consumes the issue ids.
+    enabled: usesGantt || agentRunningFilter,
+  });
+  const workspaceWorkingAgents = workingAgentsProjection.data ?? EMPTY_LIST;
+  const workingFilterUnresolved =
+    agentRunningFilter && workingAgentsProjection.data === undefined;
+  const workingFilterPending =
+    workingFilterUnresolved && workingAgentsProjection.isPending;
+  const workingFilterError =
+    workingFilterUnresolved && workingAgentsProjection.isError;
   const workingIssueIDs = useMemo(() => {
     const issueIDs = new Set<string>();
     for (const agent of workspaceWorkingAgents) {
@@ -494,7 +507,9 @@ export function useIssueSurfaceController({
           ? { properties: effectivePropertyFilters }
           : {}),
         ...(date ? { date } : {}),
-        ...(agentRunningFilter
+        // Unknown membership must not create a temporary match-nothing query
+        // key. Dependent fetches stay gated until the projection resolves.
+        ...(agentRunningFilter && !workingFilterUnresolved
           ? { working_issue_ids: [...workingIssueIDs] }
           : {}),
         include_sub_issues: showSubIssues,
@@ -523,6 +538,7 @@ export function useIssueSurfaceController({
     statusFilters,
     viewIncludeNoProject,
     viewProjectFilters,
+    workingFilterUnresolved,
     workingIssueIDs,
   ]);
   // Every consumer below — the facet request, the status/group branch hooks and
@@ -568,8 +584,10 @@ export function useIssueSurfaceController({
     // every custom-property facet made a Table mount issue up to 47 SQL
     // statements and repeatedly scan the issue table after invalidation.
     enabled:
-      usesServerStatusSurface ||
-      ((usesTable || usesServerGroupSurface) && activeTableFacet !== null),
+      !workingFilterUnresolved && (
+        usesServerStatusSurface ||
+        ((usesTable || usesServerGroupSurface) && activeTableFacet !== null)
+      ),
   });
   // The header chip's count, kept on its own query rather than folded into the
   // submenu facet request above. Two reasons: that request is deliberately
@@ -631,7 +649,7 @@ export function useIssueSurfaceController({
     facets: tableFacetsQuery.data,
     facetsPending: tableFacetsQuery.isPending,
     facetsFetching: tableFacetsQuery.isFetching,
-    enabled: usesServerStatusSurface && !statusFilterUnresolved,
+    enabled: usesServerStatusSurface && !statusFilterUnresolved && !workingFilterUnresolved,
   });
   const serverGroupSpec = useMemo<IssueTableGroupsRequest["group"]>(() => {
     if (effectiveViewMode === "swimlane") {
@@ -672,7 +690,7 @@ export function useIssueSurfaceController({
     observeEmptyBranches:
       effectiveViewMode === "swimlane" ||
       (effectiveViewMode === "board" && activeGroupingProperty !== null),
-    enabled: usesServerGroupSurface && !statusFilterUnresolved,
+    enabled: usesServerGroupSurface && !statusFilterUnresolved && !workingFilterUnresolved,
   });
 
   // Selection is only meaningful within the current membership window: batch
@@ -768,7 +786,7 @@ export function useIssueSurfaceController({
   const workingAgents = useMemo<WorkingAgentSummary[] | undefined>(() => {
     if (!usesGantt) return facetWorkingAgents;
     const rows = data.ganttWorkingScopeIssues;
-    if (!rows) return undefined;
+    if (!rows || workingAgentsProjection.data === undefined) return undefined;
     const visible = new Set(rows.map((issue) => issue.id));
     const summaries: WorkingAgentSummary[] = [];
     for (const agent of workspaceWorkingAgents) {
@@ -783,6 +801,7 @@ export function useIssueSurfaceController({
     facetWorkingAgents,
     usesGantt,
     workspaceWorkingAgents,
+    workingAgentsProjection.data,
   ]);
 
   const exportTableIssues = useCallback(async () => {
@@ -847,6 +866,7 @@ export function useIssueSurfaceController({
     viewMode: effectiveViewMode,
     allowGantt: allowedModes.has("gantt") && !!projectId,
     ...surfaceData,
+    isLoading: data.isLoading || workingFilterPending,
     workingAgents,
     hasActiveFilters,
     statusPagination: usesServerStatusSurface
@@ -860,6 +880,7 @@ export function useIssueSurfaceController({
     // debounced value as well to avoid a brief empty-screen flash while a
     // cleared query is waiting to re-fetch the unsearched window.
     isEmpty:
+      !workingFilterUnresolved &&
       data.isEmpty &&
       !data.isRefreshing &&
       !(usesTable && (tableSearch.trim() || debouncedActiveSearch)),
@@ -869,6 +890,10 @@ export function useIssueSurfaceController({
     retryStatusCatalog: () => {
       catalog.retry();
       data.retryProjectCatalog();
+    },
+    isWorkingFilterError: workingFilterError,
+    retryWorkingFilter: () => {
+      void workingAgentsProjection.refetch();
     },
     sort,
     actions,

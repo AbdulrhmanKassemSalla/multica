@@ -8,6 +8,7 @@ import {
   ArrowDown,
   ArrowUp,
   GripVertical,
+  Lock,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -105,7 +106,10 @@ import { StatusIcon } from "../../issues/components/status-icon";
 import { useStatusLabel } from "../../issues/utils/status-label";
 import { useT } from "../../i18n";
 import { AppLink, useNavigation } from "../../navigation";
-import { SettingsTab } from "./settings-layout";
+import {
+  SettingsReadOnlyNotice,
+  SettingsTab,
+} from "./settings-layout";
 import { settingsHref } from "./settings-navigation";
 
 /**
@@ -162,7 +166,6 @@ export function IssueStatusesTab({
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [inspection, setInspection] = useState<{ workspaceId: string; status: IssueStatusEntry } | null>(null);
   const [inspectionOpen, setInspectionOpen] = useState(false);
-  const [showBuiltInNotice, setShowBuiltInNotice] = useState(false);
 
   const { data: statuses = [], isLoading } = useQuery(issueStatusListOptions(wsId));
   const { data: members = [] } = useQuery(memberListOptions(wsId));
@@ -172,11 +175,11 @@ export function IssueStatusesTab({
     return members.find((m) => m.user_id === currentUser.id)?.role ?? null;
   }, [members, currentUser]);
   const isAdmin = myRole === "owner" || myRole === "admin";
-  // The status a merge moves issues to is set on the GitHub page (MUL-7726);
+  // The status a merge moves issues to is set on the Code page (MUL-7726);
   // its row carries a badge linking there.
   const mergeTarget = derivePRMergeStatus(useCurrentWorkspace());
-  const mergeSettingsHref = settingsHref(navigation.pathname, navigation.searchParams, "integrations", {
-    integration: "github",
+  const mergeSettingsHref = settingsHref(navigation.pathname, navigation.searchParams, "code", {
+    section: "pr-merge-status",
   });
 
   const groups = useMemo(
@@ -206,6 +209,7 @@ export function IssueStatusesTab({
 
   const body = (
     <>
+      {myRole && !isAdmin ? <SettingsReadOnlyNotice wsId={wsId} /> : null}
       <div className="space-y-4">
         {/* Embedded under Workflows, the section description already covers reordering. */}
         {isAdmin && !embedded && (
@@ -240,10 +244,9 @@ export function IssueStatusesTab({
                 mergeTarget={mergeTarget}
                 mergeSettingsHref={mergeSettingsHref}
                 onCreate={() => setCreateCategory(group.category)}
-                onEdit={(entry) => entry.is_system ? setShowBuiltInNotice(true) : setEditing(entry)}
+                onEdit={(entry) => setEditing(entry)}
                 onArchive={(entry) => {
-                  if (entry.is_system) setShowBuiltInNotice(true);
-                  else { setPendingArchive(entry); setArchiveOpen(true); }
+                  setPendingArchive(entry); setArchiveOpen(true);
                 }}
                 onViewIssues={viewIssues}
               />
@@ -271,19 +274,6 @@ export function IssueStatusesTab({
           {inspection?.workspaceId === wsId && <StatusIssueInspection key={`${wsId}:${inspection.status.key}`} status={inspection.status} onClose={() => setInspectionOpen(false)} />}
         </DialogContent>
       </Dialog>
-      <AlertDialog open={showBuiltInNotice} onOpenChange={setShowBuiltInNotice}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>{t(($) => $.issue_statuses.built_in_dialog.title)}</AlertDialogTitle>
-            <AlertDialogDescription>{t(($) => $.issue_statuses.built_in_dialog.description)}</AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel variant="default">
-              {t(($) => $.issue_statuses.built_in_dialog.confirm)}
-            </AlertDialogCancel>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </>
   );
 
@@ -296,7 +286,7 @@ export function IssueStatusesTab({
       {body}
     </section>
   ) : (
-    <SettingsTab title={t(($) => $.issue_statuses.title)}>{body}</SettingsTab>
+    <SettingsTab title={t(($) => $.page.tabs.issue_statuses)} scope="workspace">{body}</SettingsTab>
   );
 }
 
@@ -519,7 +509,7 @@ function StatusRow({
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-body font-medium">{label}</span>
           {workflowUsage !== undefined && entry.is_system && (
-            <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
+            <span className="shrink-0 rounded-xs bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
               {t(($) => $.issue_statuses.builtin_badge)}
             </span>
           )}
@@ -584,14 +574,23 @@ function StatusRow({
               {t(($) => $.issue_statuses.actions.move_down)}
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem onClick={onEdit}>
+            {/* Built-ins drive system behavior, so their definition is locked.
+                Say so where the actions are instead of offering them and
+                refusing afterwards. */}
+            <DropdownMenuItem disabled={entry.is_system} onClick={onEdit}>
               <Pencil className="size-4" />
               {t(($) => $.issue_statuses.actions.edit)}
             </DropdownMenuItem>
-            <DropdownMenuItem variant="destructive" onClick={onArchive}>
+            <DropdownMenuItem variant="destructive" disabled={entry.is_system} onClick={onArchive}>
               <Archive className="size-4" />
               {t(($) => $.issue_statuses.actions.archive)}
             </DropdownMenuItem>
+            {entry.is_system && (
+              <p className="flex max-w-64 gap-1.5 px-2 pb-1 pt-1.5 text-caption leading-4 text-muted-foreground">
+                <Lock className="mt-0.5 size-3 shrink-0" aria-hidden="true" />
+                {t(($) => $.issue_statuses.built_in_locked)}
+              </p>
+            )}
           </DropdownMenuContent>
         </DropdownMenu>
       )}

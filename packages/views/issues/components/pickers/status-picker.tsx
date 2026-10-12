@@ -222,7 +222,7 @@ function StepHandoffHint({ step, project }: { step: IssueWorkflowStep | undefine
   const handler = handlerLabel(step);
   if (!handler) {
     return (
-      <span className="ml-auto shrink-0 pl-2 text-caption text-muted-foreground/70">
+      <span className="ml-auto shrink-0 pl-2 text-caption text-muted-foreground">
         {t(($) => $.workflows.handler.none)}
       </span>
     );

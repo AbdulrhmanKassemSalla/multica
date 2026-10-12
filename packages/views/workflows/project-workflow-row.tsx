@@ -148,7 +148,7 @@ export function ProjectWorkflowControl({ project }: { project: Project }) {
                   <span className="flex items-center gap-2">
                     <span className="truncate font-medium">{option.name}</span>
                     {option.isDefault && (
-                      <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
+                      <span className="shrink-0 rounded-xs bg-muted px-1.5 py-0.5 text-micro text-muted-foreground">
                         {t(($) => $.workflows.project.default_badge)}
                       </span>
                     )}
