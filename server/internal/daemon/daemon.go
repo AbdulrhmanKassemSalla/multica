@@ -191,11 +191,21 @@ func taskMulticaEnvironment(task Task, provider, agentName, token, configRoot, w
 		"TMP":                  tempDir,
 		"TEMP":                 tempDir,
 	}
-	if runtime.GOOS == "windows" && provider == "claude" {
-		// Git Bash shares its /tmp mount across processes. Keep its host temp
-		// target alive while TMPDIR and Claude's internal files stay task-local.
-		delete(env, "TMP")
-		delete(env, "TEMP")
+	if runtime.GOOS != "windows" {
+		return env
+	}
+	// MSYS (Git Bash) resolves its `/tmp usertemp` mount from TMP/TEMP once,
+	// in the first process, and every live MSYS process of this user shares
+	// that mount table — whichever provider started it. A task-private TMP/TEMP
+	// would pin /tmp to a directory this daemon deletes when that task ends,
+	// breaking /tmp for every later task (#8824). So on Windows no task
+	// overrides TMP/TEMP; they inherit the daemon user's host temp, and only
+	// TMPDIR stays task-private.
+	delete(env, "TMP")
+	delete(env, "TEMP")
+	if provider == "claude" {
+		// Claude Code reads CLAUDE_CODE_TMPDIR for its own temp files; default
+		// it to the task dir so they stay private, unless the user set it.
 		if os.Getenv("CLAUDE_CODE_TMPDIR") == "" {
 			env["CLAUDE_CODE_TMPDIR"] = tempDir
 			if task.Agent != nil {

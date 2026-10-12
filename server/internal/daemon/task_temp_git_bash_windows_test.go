@@ -20,7 +20,9 @@ import (
 
 // This is an opt-in test of real Git for Windows, not an agent CLI or account.
 // Run with -tags=gitbashintegration and MULTICA_TEST_GIT_BASH=<bash.exe>.
-func TestWindowsClaudeGitBashTaskTempLifecycle(t *testing.T) {
+// Tasks alternate providers: the MSYS /tmp mount is shared by every live Bash
+// of this user, so a non-Claude task seeding it must be just as safe (#8824).
+func TestWindowsGitBashTaskTempLifecycle(t *testing.T) {
 	bash := os.Getenv("MULTICA_TEST_GIT_BASH")
 	if bash == "" {
 		t.Skip("set MULTICA_TEST_GIT_BASH to explicitly select Git for Windows")
@@ -50,7 +52,7 @@ func TestWindowsClaudeGitBashTaskTempLifecycle(t *testing.T) {
 		return dir, lock
 	}
 
-	start := func(dir string, orphan bool) (map[string]string, func()) {
+	start := func(dir, provider string, orphan bool) (map[string]string, func()) {
 		t.Helper()
 		script := `printf 'PID='; /usr/bin/cat /proc/$$/winpid; printf '\n'
 printf 'TMPDIR=%s\n' "$(/usr/bin/cygpath -w "$TMPDIR")"
@@ -85,7 +87,7 @@ IFS= read -r release
 		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 		cmd.Stdin, cmd.Stdout, cmd.Stderr = input, sink, stderr
 		cmd.Env = os.Environ()
-		for key, value := range taskMulticaEnvironment(Task{}, "claude", "", "", "", "", "", 0, 0, dir) {
+		for key, value := range taskMulticaEnvironment(Task{}, provider, "", "", "", "", "", 0, 0, dir) {
 			cmd.Env = append(cmd.Env, key+"="+value)
 		}
 		if err := cmd.Start(); err != nil {
@@ -148,12 +150,12 @@ IFS= read -r release
 	}
 
 	first, firstLock := newTask()
-	initial, stopFirst := start(first, false)
+	initial, stopFirst := start(first, "codex", false)
 	if !strings.EqualFold(initial["TARGET"], hostTemp) && !strings.EqualFold(initial["TARGET"], first) {
 		t.Skipf("another MSYS process already owns /tmp at %q", initial["TARGET"])
 	}
 	second, secondLock := newTask()
-	overlap, stopOrphan := start(second, true)
+	overlap, stopOrphan := start(second, "claude", true)
 	stopFirst()
 	execenv.ReleaseTaskTempLock(firstLock)
 	if err := execenv.RemoveTaskTempDir(first); err != nil {
@@ -166,7 +168,7 @@ IFS= read -r release
 		t.Fatalf("GC removed %d dirs while the second task held its lock", removed)
 	}
 	third, thirdLock := newTask()
-	afterDelete, stopThird := start(third, false)
+	afterDelete, stopThird := start(third, "opencode", false)
 	for name, snapshot := range map[string]map[string]string{"overlap": overlap, "after deletion with orphan alive": afterDelete} {
 		if snapshot["TMP_OK"] != "yes" {
 			t.Errorf("%s: /tmp unusable: %v", name, snapshot)
@@ -184,7 +186,7 @@ IFS= read -r release
 		}
 	}
 	fourth, _ := newTask()
-	sequential, stopFourth := start(fourth, false)
+	sequential, stopFourth := start(fourth, "claude", false)
 	if sequential["TMP_OK"] != "yes" || !strings.EqualFold(sequential["TARGET"], hostTemp) {
 		t.Fatalf("sequential task after cleanup: %v", sequential)
 	}
