@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"time"
@@ -659,44 +660,147 @@ func (s *IssueWakeupService) TickWorkspaces(ctx context.Context, workspaceIDs ..
 	return s.tick(ctx, workspaceIDs)
 }
 
+// Scheduler pass limits. A pass used to visit a single batch of 100 rules, so
+// with more ready rules than that a status change waited several passes
+// (minutes) behind condition checks that had nothing new (MUL-7933, #9139).
+// A pass now keeps taking batches until both lanes are drained or a limit is
+// hit. The scheduler runs its jobs one after another, so the pass stops well
+// inside the job's 45s run timeout and leaves the rest of the 30s scheduler
+// tick to the other jobs; one dispatch is itself capped at 2s.
+const (
+	wakeupTickBatch = 100
+	// At most this many rules of a batch come from the input lane, so the due
+	// lane (schedules, deadlines, condition checks) always gets the rest of
+	// every batch and a steady event stream cannot starve it.
+	wakeupTickInputShare = 50
+	wakeupTickBudget     = 15 * time.Second
+	wakeupTickMaxRules   = 1500
+	// A pending input older than this is logged as a warning.
+	wakeupPendingWarnAge = 2 * time.Minute
+)
+
 // tick dispatches ready wakeups; nil workspaceIDs means every workspace.
+//
+// Two lanes feed each batch: rules with unprocessed inputs (an event, a
+// condition hint, "wake now") and rules whose schedule, deadline or condition
+// check is due. Each rule is visited at most once per pass.
 func (s *IssueWakeupService) tick(ctx context.Context, workspaceIDs []pgtype.UUID) error {
+	start := time.Now()
 	// Receipts are operational evidence, not the run history. Match the existing
 	// event telemetry's seven-day retention; never expire unprocessed inputs.
 	cleanupCtx, cleanupCancel := context.WithTimeout(ctx, 2*time.Second)
 	_, cleanupErr := s.Tasks.Queries.DeleteExpiredWakeupReceipts(cleanupCtx, pgtype.Timestamptz{Time: time.Now().Add(-7 * 24 * time.Hour), Valid: true})
 	cleanupCancel()
-	rows, err := s.Tasks.Queries.ListReadyWakeups(ctx, workspaceIDs)
-	if err != nil {
-		return err
-	}
 	var errs []error
 	if cleanupErr != nil {
 		errs = append(errs, fmt.Errorf("expire wakeup receipts: %w", cleanupErr))
 	}
-	for _, w := range rows {
-		if ctx.Err() != nil {
-			return errors.Join(append(errs, ctx.Err())...)
+	// Never nil: "id = ANY(NULL)" is NULL and would exclude every rule.
+	visited := []pgtype.UUID{}
+	inputs, due := 0, 0
+	stop := "drained"
+	exhausted := func() bool {
+		switch {
+		case len(visited) >= wakeupTickMaxRules:
+			stop = "rule_cap"
+		case time.Since(start) >= wakeupTickBudget:
+			stop = "time_budget"
+		default:
+			return false
 		}
-		// Outcome writes must not turn a busy rule row into another batch-wide
-		// wait. Use the batch context, not dispatch's expired per-rule context.
-		dispatch := s.dispatch
-		if w.SystemRule.Valid {
-			dispatch = s.dispatchSystem
+		return true
+	}
+batches:
+	for !exhausted() {
+		room := min(wakeupTickBatch, wakeupTickMaxRules-len(visited))
+		inputLimit := min(wakeupTickInputShare, room)
+		inputRows, err := s.Tasks.Queries.ListInputWakeups(ctx, db.ListInputWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: visited, RowLimit: int32(inputLimit)})
+		if err != nil {
+			return errors.Join(append(errs, err)...)
 		}
-		if err = dispatch(ctx, w); err != nil {
-			errs = append(errs, fmt.Errorf("wakeup %s: %w", util.UUIDToString(w.ID), err))
-			outcomeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-			_ = s.Tasks.Queries.NoteWakeupFailure(outcomeCtx, db.NoteWakeupFailureParams{ID: w.ID, LastError: pgtype.Text{String: truncateForSummary(err.Error(), 500), Valid: true}})
-			cancel()
+		// Exclude this batch's input rules from the due lane as well.
+		batchSkip := slices.Clone(visited)
+		for _, w := range inputRows {
+			batchSkip = append(batchSkip, w.ID)
 		}
-		outcomeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-		if touchErr := s.Tasks.Queries.TouchWakeupDispatch(outcomeCtx, w.ID); touchErr != nil {
-			errs = append(errs, touchErr)
+		dueLimit := room - len(inputRows)
+		dueRows, err := s.Tasks.Queries.ListDueWakeups(ctx, db.ListDueWakeupsParams{WorkspaceIds: workspaceIDs, SkipIds: batchSkip, RowLimit: int32(dueLimit)})
+		if err != nil {
+			return errors.Join(append(errs, err)...)
 		}
-		cancel()
+		batch := append(inputRows, dueRows...)
+		for i, w := range batch {
+			if ctx.Err() != nil {
+				return errors.Join(append(errs, ctx.Err())...)
+			}
+			if exhausted() {
+				break batches
+			}
+			visited = append(visited, w.ID)
+			if i < len(inputRows) {
+				inputs++
+			} else {
+				due++
+			}
+			errs = append(errs, s.dispatchFromTick(ctx, w)...)
+		}
+		if len(inputRows) < inputLimit && len(dueRows) < dueLimit {
+			break
+		}
+	}
+	if workspaceIDs == nil {
+		s.logTick(ctx, start, inputs, due, stop, len(errs))
 	}
 	return errors.Join(errs...)
+}
+
+// dispatchFromTick dispatches one rule for a scheduler pass and records the
+// outcome on the rule.
+func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWakeup) []error {
+	var errs []error
+	// Outcome writes must not turn a busy rule row into another batch-wide
+	// wait. Use the batch context, not dispatch's expired per-rule context.
+	dispatch := s.dispatch
+	if w.SystemRule.Valid {
+		dispatch = s.dispatchSystem
+	}
+	if err := dispatch(ctx, w); err != nil {
+		errs = append(errs, fmt.Errorf("wakeup %s: %w", util.UUIDToString(w.ID), err))
+		outcomeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+		_ = s.Tasks.Queries.NoteWakeupFailure(outcomeCtx, db.NoteWakeupFailureParams{ID: w.ID, LastError: pgtype.Text{String: truncateForSummary(err.Error(), 500), Valid: true}})
+		cancel()
+	}
+	// Move the rule to the back of its lane so one noisy issue cannot
+	// monopolize the batches.
+	outcomeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	if touchErr := s.Tasks.Queries.TouchWakeupDispatch(outcomeCtx, w.ID); touchErr != nil {
+		errs = append(errs, touchErr)
+	}
+	cancel()
+	return errs
+}
+
+// logTick reports one global pass: how many rules each lane visited, how long
+// the pass took, why it stopped, and how old the oldest input still pending
+// is. A pass cut short by a limit, or an input waiting longer than
+// wakeupPendingWarnAge, logs at warn level.
+func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, inputs, due int, stop string, failures int) {
+	attrs := []any{"input_rules", inputs, "due_rules", due, "duration_ms", time.Since(start).Milliseconds(), "stopped", stop, "failures", failures}
+	level := slog.LevelInfo
+	if stop != "drained" {
+		level = slog.LevelWarn
+	}
+	ageCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	oldest, err := s.Tasks.Queries.OldestPendingWakeupReceipt(ageCtx)
+	cancel()
+	if err == nil && oldest.Valid {
+		age := time.Since(oldest.Time)
+		attrs = append(attrs, "oldest_pending_input_age_s", int64(age.Seconds()))
+		if age > wakeupPendingWarnAge {
+			level = slog.LevelWarn
+		}
+	}
+	slog.Log(ctx, level, "issue wakeup dispatch pass", attrs...)
 }
 
 func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) error {

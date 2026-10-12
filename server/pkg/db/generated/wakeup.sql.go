@@ -750,6 +750,163 @@ func (q *Queries) GetIssueWakeup(ctx context.Context, arg GetIssueWakeupParams) 
 	return i, err
 }
 
+const listDueWakeups = `-- name: ListDueWakeups :many
+WITH candidates AS (
+ SELECT id FROM issue_wakeup WHERE enabled AND kind<>'event' AND next_fire_at<=now()
+ UNION
+ SELECT id FROM issue_wakeup WHERE enabled AND expires_at<=now()
+ UNION
+ SELECT id FROM issue_wakeup WHERE enabled AND condition IS NOT NULL AND next_fire_at<=now()
+)
+SELECT w.id, w.workspace_id, w.issue_id, w.agent_id, w.created_by, w.source_task_id, w.parent_comment_id, w.instruction, w.kind, w.mode, w.event_types, w.filter_agent_id, w.filter_task_id, w.interval_seconds, w.cron_expression, w.timezone, w.next_fire_at, w.enabled, w.disabled_at, w.revision, w.last_task_id, w.last_error, w.created_at, w.updated_at, w.filter_actor_type, w.filter_actor_id, w.expires_at, w.expiry_seconds, w.on_timeout, w.timed_out_at, w.system_rule, w.customized_at, w.condition, w.condition_state, w.max_fires, w.fire_count, w.paused_reason FROM candidates c JOIN issue_wakeup w ON w.id=c.id
+WHERE ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
+  AND NOT (w.id = ANY($2::uuid[]))
+ORDER BY w.updated_at,w.id LIMIT $3
+`
+
+type ListDueWakeupsParams struct {
+	WorkspaceIds []pgtype.UUID `json:"workspace_ids"`
+	SkipIds      []pgtype.UUID `json:"skip_ids"`
+	RowLimit     int32         `json:"row_limit"`
+}
+
+// Scheduler lane 2: schedules, deadlines and condition checks that are due.
+// Rules already visited in this pass are skipped.
+func (q *Queries) ListDueWakeups(ctx context.Context, arg ListDueWakeupsParams) ([]IssueWakeup, error) {
+	rows, err := q.db.Query(ctx, listDueWakeups, arg.WorkspaceIds, arg.SkipIds, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IssueWakeup{}
+	for rows.Next() {
+		var i IssueWakeup
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.IssueID,
+			&i.AgentID,
+			&i.CreatedBy,
+			&i.SourceTaskID,
+			&i.ParentCommentID,
+			&i.Instruction,
+			&i.Kind,
+			&i.Mode,
+			&i.EventTypes,
+			&i.FilterAgentID,
+			&i.FilterTaskID,
+			&i.IntervalSeconds,
+			&i.CronExpression,
+			&i.Timezone,
+			&i.NextFireAt,
+			&i.Enabled,
+			&i.DisabledAt,
+			&i.Revision,
+			&i.LastTaskID,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FilterActorType,
+			&i.FilterActorID,
+			&i.ExpiresAt,
+			&i.ExpirySeconds,
+			&i.OnTimeout,
+			&i.TimedOutAt,
+			&i.SystemRule,
+			&i.CustomizedAt,
+			&i.Condition,
+			&i.ConditionState,
+			&i.MaxFires,
+			&i.FireCount,
+			&i.PausedReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listInputWakeups = `-- name: ListInputWakeups :many
+SELECT w.id, w.workspace_id, w.issue_id, w.agent_id, w.created_by, w.source_task_id, w.parent_comment_id, w.instruction, w.kind, w.mode, w.event_types, w.filter_agent_id, w.filter_task_id, w.interval_seconds, w.cron_expression, w.timezone, w.next_fire_at, w.enabled, w.disabled_at, w.revision, w.last_task_id, w.last_error, w.created_at, w.updated_at, w.filter_actor_type, w.filter_actor_id, w.expires_at, w.expiry_seconds, w.on_timeout, w.timed_out_at, w.system_rule, w.customized_at, w.condition, w.condition_state, w.max_fires, w.fire_count, w.paused_reason FROM issue_wakeup w
+WHERE w.id IN (SELECT r.wakeup_id FROM issue_wakeup_receipt r WHERE r.processed_at IS NULL)
+  AND ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
+  AND NOT (w.id = ANY($2::uuid[]))
+ORDER BY w.updated_at,w.id LIMIT $3
+`
+
+type ListInputWakeupsParams struct {
+	WorkspaceIds []pgtype.UUID `json:"workspace_ids"`
+	SkipIds      []pgtype.UUID `json:"skip_ids"`
+	RowLimit     int32         `json:"row_limit"`
+}
+
+// Scheduler lane 1: rules with unprocessed inputs (subscribed events,
+// condition hints, "wake now"). Deliberately not filtered by enabled: a once
+// rule that stopped still delivers the inputs it captured before stopping.
+// The subquery reads only pending rows (issue_wakeup_receipt_pending_idx).
+// Rules already visited in this pass are skipped.
+func (q *Queries) ListInputWakeups(ctx context.Context, arg ListInputWakeupsParams) ([]IssueWakeup, error) {
+	rows, err := q.db.Query(ctx, listInputWakeups, arg.WorkspaceIds, arg.SkipIds, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IssueWakeup{}
+	for rows.Next() {
+		var i IssueWakeup
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.IssueID,
+			&i.AgentID,
+			&i.CreatedBy,
+			&i.SourceTaskID,
+			&i.ParentCommentID,
+			&i.Instruction,
+			&i.Kind,
+			&i.Mode,
+			&i.EventTypes,
+			&i.FilterAgentID,
+			&i.FilterTaskID,
+			&i.IntervalSeconds,
+			&i.CronExpression,
+			&i.Timezone,
+			&i.NextFireAt,
+			&i.Enabled,
+			&i.DisabledAt,
+			&i.Revision,
+			&i.LastTaskID,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.FilterActorType,
+			&i.FilterActorID,
+			&i.ExpiresAt,
+			&i.ExpirySeconds,
+			&i.OnTimeout,
+			&i.TimedOutAt,
+			&i.SystemRule,
+			&i.CustomizedAt,
+			&i.Condition,
+			&i.ConditionState,
+			&i.MaxFires,
+			&i.FireCount,
+			&i.PausedReason,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listIssueWakeups = `-- name: ListIssueWakeups :many
 SELECT w.id,w.workspace_id,w.issue_id,w.agent_id,w.created_by,w.source_task_id,w.parent_comment_id,w.instruction,
  w.kind,w.mode,w.event_types,w.filter_actor_type,
@@ -962,79 +1119,6 @@ func (q *Queries) ListPendingWakeupReceipts(ctx context.Context, arg ListPending
 			&i.ProcessedAt,
 			&i.CreatedAt,
 			&i.CoalesceKey,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listReadyWakeups = `-- name: ListReadyWakeups :many
-WITH candidates AS (
- SELECT id FROM issue_wakeup WHERE enabled AND kind<>'event' AND next_fire_at<=now()
- UNION
- SELECT id FROM issue_wakeup WHERE enabled AND expires_at<=now()
- UNION
- SELECT id FROM issue_wakeup WHERE enabled AND condition IS NOT NULL AND next_fire_at<=now()
- UNION
- SELECT wakeup_id FROM issue_wakeup_receipt WHERE processed_at IS NULL
-)
-SELECT w.id, w.workspace_id, w.issue_id, w.agent_id, w.created_by, w.source_task_id, w.parent_comment_id, w.instruction, w.kind, w.mode, w.event_types, w.filter_agent_id, w.filter_task_id, w.interval_seconds, w.cron_expression, w.timezone, w.next_fire_at, w.enabled, w.disabled_at, w.revision, w.last_task_id, w.last_error, w.created_at, w.updated_at, w.filter_actor_type, w.filter_actor_id, w.expires_at, w.expiry_seconds, w.on_timeout, w.timed_out_at, w.system_rule, w.customized_at, w.condition, w.condition_state, w.max_fires, w.fire_count, w.paused_reason FROM candidates c JOIN issue_wakeup w ON w.id=c.id
-WHERE $1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[])
-ORDER BY w.updated_at,w.id LIMIT 100
-`
-
-func (q *Queries) ListReadyWakeups(ctx context.Context, workspaceIds []pgtype.UUID) ([]IssueWakeup, error) {
-	rows, err := q.db.Query(ctx, listReadyWakeups, workspaceIds)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []IssueWakeup{}
-	for rows.Next() {
-		var i IssueWakeup
-		if err := rows.Scan(
-			&i.ID,
-			&i.WorkspaceID,
-			&i.IssueID,
-			&i.AgentID,
-			&i.CreatedBy,
-			&i.SourceTaskID,
-			&i.ParentCommentID,
-			&i.Instruction,
-			&i.Kind,
-			&i.Mode,
-			&i.EventTypes,
-			&i.FilterAgentID,
-			&i.FilterTaskID,
-			&i.IntervalSeconds,
-			&i.CronExpression,
-			&i.Timezone,
-			&i.NextFireAt,
-			&i.Enabled,
-			&i.DisabledAt,
-			&i.Revision,
-			&i.LastTaskID,
-			&i.LastError,
-			&i.CreatedAt,
-			&i.UpdatedAt,
-			&i.FilterActorType,
-			&i.FilterActorID,
-			&i.ExpiresAt,
-			&i.ExpirySeconds,
-			&i.OnTimeout,
-			&i.TimedOutAt,
-			&i.SystemRule,
-			&i.CustomizedAt,
-			&i.Condition,
-			&i.ConditionState,
-			&i.MaxFires,
-			&i.FireCount,
-			&i.PausedReason,
 		); err != nil {
 			return nil, err
 		}
@@ -1505,6 +1589,19 @@ type NoteWakeupFailureParams struct {
 func (q *Queries) NoteWakeupFailure(ctx context.Context, arg NoteWakeupFailureParams) error {
 	_, err := q.db.Exec(ctx, noteWakeupFailure, arg.LastError, arg.ID)
 	return err
+}
+
+const oldestPendingWakeupReceipt = `-- name: OldestPendingWakeupReceipt :one
+SELECT min(created_at)::timestamptz AS oldest FROM issue_wakeup_receipt WHERE processed_at IS NULL
+`
+
+// Scheduler observability: when the oldest still-unprocessed input arrived.
+// Inputs held for a run that has not started yet legitimately stay pending.
+func (q *Queries) OldestPendingWakeupReceipt(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, oldestPendingWakeupReceipt)
+	var oldest pgtype.Timestamptz
+	err := row.Scan(&oldest)
+	return oldest, err
 }
 
 const pauseIssueWakeup = `-- name: PauseIssueWakeup :exec

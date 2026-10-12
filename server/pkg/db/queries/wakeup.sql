@@ -70,19 +70,35 @@ WHERE issue_id= @issue_id AND disabled_at IS NULL AND system_rule IS NULL;
 -- name: CancelUnstartedIssueWakeupTasks :many
 UPDATE agent_task_queue SET status='cancelled',completed_at=now(),error='Issue closed; wakeup disabled'
 WHERE issue_id= @issue_id AND context->>'wakeup_id' IS NOT NULL AND status IN ('queued','deferred') AND started_at IS NULL RETURNING *;
--- name: ListReadyWakeups :many
+-- name: ListInputWakeups :many
+-- Scheduler lane 1: rules with unprocessed inputs (subscribed events,
+-- condition hints, "wake now"). Deliberately not filtered by enabled: a once
+-- rule that stopped still delivers the inputs it captured before stopping.
+-- The subquery reads only pending rows (issue_wakeup_receipt_pending_idx).
+-- Rules already visited in this pass are skipped.
+SELECT w.* FROM issue_wakeup w
+WHERE w.id IN (SELECT r.wakeup_id FROM issue_wakeup_receipt r WHERE r.processed_at IS NULL)
+  AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
+  AND NOT (w.id = ANY(@skip_ids::uuid[]))
+ORDER BY w.updated_at,w.id LIMIT @row_limit;
+-- name: ListDueWakeups :many
+-- Scheduler lane 2: schedules, deadlines and condition checks that are due.
+-- Rules already visited in this pass are skipped.
 WITH candidates AS (
  SELECT id FROM issue_wakeup WHERE enabled AND kind<>'event' AND next_fire_at<=now()
  UNION
  SELECT id FROM issue_wakeup WHERE enabled AND expires_at<=now()
  UNION
  SELECT id FROM issue_wakeup WHERE enabled AND condition IS NOT NULL AND next_fire_at<=now()
- UNION
- SELECT wakeup_id FROM issue_wakeup_receipt WHERE processed_at IS NULL
 )
 SELECT w.* FROM candidates c JOIN issue_wakeup w ON w.id=c.id
-WHERE sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[])
-ORDER BY w.updated_at,w.id LIMIT 100;
+WHERE (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
+  AND NOT (w.id = ANY(@skip_ids::uuid[]))
+ORDER BY w.updated_at,w.id LIMIT @row_limit;
+-- name: OldestPendingWakeupReceipt :one
+-- Scheduler observability: when the oldest still-unprocessed input arrived.
+-- Inputs held for a run that has not started yet legitimately stay pending.
+SELECT min(created_at)::timestamptz AS oldest FROM issue_wakeup_receipt WHERE processed_at IS NULL;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 
