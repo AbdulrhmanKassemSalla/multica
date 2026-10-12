@@ -829,6 +829,9 @@ export function useRealtimeSync(
         const wsId = getCurrentWsId();
         if (wsId) {
           qc.invalidateQueries({ queryKey: projectKeys.all(wsId) });
+          // Workflow responses include the projects using them. Creating,
+          // deleting or changing a project also changes that usage list.
+          qc.invalidateQueries({ queryKey: issueWorkflowKeys.all(wsId) });
           // The issue table can filter on a project's status, so a
           // project create/update/delete changes which issues a filtered
           // window holds. The payload carries no previous status to compare
