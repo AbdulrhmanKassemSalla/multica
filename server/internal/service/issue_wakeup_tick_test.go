@@ -11,6 +11,15 @@ import (
 	"github.com/multica-ai/multica/server/pkg/dbid"
 )
 
+// drainTick runs one pass over the workspace with room to finish: these tests
+// pin which rules a pass reaches, not how fast a loaded CI machine runs them.
+func drainTick(t *testing.T, s *IssueWakeupService, ws pgtype.UUID) {
+	t.Helper()
+	if err := s.tickWith(context.Background(), []pgtype.UUID{ws}, tickLimits{budget: 5 * time.Minute, inputBudget: 5 * time.Minute}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // idleConditionRules adds n enabled condition rules whose condition never
 // holds, all due and ordered ahead of everything else, the way a busy
 // production scan looks to a freshly hinted rule. They are spread over issues
@@ -71,9 +80,7 @@ func TestWakeupTickFiresStatusHintBehindManyDueChecks(t *testing.T) {
 	}
 	f.Exec(t, "UPDATE agent_task_queue SET status='completed', completed_at=now() WHERE id=$1", run)
 
-	if err := s.TickWorkspaces(ctx, ws); err != nil {
-		t.Fatal(err)
-	}
+	drainTick(t, s, ws)
 	if n := wakeRuns(t, f, w.ID); n != 1 {
 		t.Fatalf("reviewer runs after one pass = %d, want 1", n)
 	}
@@ -86,9 +93,7 @@ func TestWakeupTickFiresStatusHintBehindManyDueChecks(t *testing.T) {
 	}
 	// Later passes do not fire the once rule again.
 	f.Exec(t, "UPDATE issue_wakeup SET next_fire_at=now()-interval '1 second' WHERE id=$1 AND next_fire_at IS NOT NULL", w.ID)
-	if err := s.TickWorkspaces(ctx, ws); err != nil {
-		t.Fatal(err)
-	}
+	drainTick(t, s, ws)
 	if n := wakeRuns(t, f, w.ID); n != 1 {
 		t.Fatalf("reviewer runs after two passes = %d, want 1", n)
 	}
@@ -119,9 +124,7 @@ func TestWakeupTickDrainsBothLanesInOnePass(t *testing.T) {
 	if len(inputs) != wakeupTickBatch+20 {
 		t.Fatalf("input lane lists %d rules, want %d (disabled rules with inputs included)", len(inputs), wakeupTickBatch+20)
 	}
-	if err = s.TickWorkspaces(ctx, ws); err != nil {
-		t.Fatal(err)
-	}
+	drainTick(t, s, ws)
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id WHERE w.issue_id=$1 AND r.processed_at IS NULL", issue); n != 0 {
 		t.Fatalf("%d inputs left pending after one pass", n)
 	}
@@ -132,39 +135,59 @@ func TestWakeupTickDrainsBothLanesInOnePass(t *testing.T) {
 
 // Slow inputs must not starve due checks (PR #9202 review): dispatches
 // alternate between the lanes, and while due work remains the input lane
-// stops at its share of the pass budget.
+// stops at its share of the pass budget. Checked by dispatch order, so a slow
+// machine cannot change the outcome.
 func TestWakeupTickSlowInputsLeaveTimeForDueChecks(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	ctx := context.Background()
 	ws := parseTestUUID(t, f.WorkspaceID)
-	idleConditionRules(t, f, s, agent, 40)
+	const dueRules, slowInputs = 40, 10
+	idleConditionRules(t, f, s, agent, dueRules)
 	seed := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "noisy"})
 	f.Exec(t, "UPDATE issue_wakeup SET enabled=false, disabled_at=now() WHERE id=$1", seed.ID)
-	cloneWakeup(t, f, seed.ID, 9, true)
+	cloneWakeup(t, f, seed.ID, slowInputs-1, true)
 	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload)
 		SELECT gen_random_uuid(),id,revision,'k','comment.created','{}' FROM issue_wakeup WHERE issue_id=$1`, issue)
 
-	// Ten inputs at 300ms each need 3s; the pass has 1.5s, a third of it for
-	// inputs while due checks remain.
-	slow := 0
-	err := s.tickWith(ctx, []pgtype.UUID{ws}, tickLimits{budget: 1500 * time.Millisecond, inputBudget: 500 * time.Millisecond,
+	// Each input takes at least 300ms; the input lane gets 500ms while due
+	// checks remain, so at most two inputs may run before the last due check.
+	var order []string
+	err := s.tickWith(ctx, []pgtype.UUID{ws}, tickLimits{budget: 5 * time.Minute, inputBudget: 500 * time.Millisecond,
 		beforeDispatch: func(w db.IssueWakeup) {
+			order = append(order, w.Instruction)
 			if w.Instruction == "noisy" {
-				slow++
 				time.Sleep(300 * time.Millisecond)
 			}
 		}})
 	if err != nil {
 		t.Fatal(err)
 	}
+	lastDue, inputsBefore, inputs := -1, 0, 0
+	for i, kind := range order {
+		if kind == "never" {
+			lastDue = i
+		}
+	}
+	for i, kind := range order {
+		if kind == "noisy" {
+			inputs++
+			if i < lastDue {
+				inputsBefore++
+			}
+		}
+	}
+	if inputsBefore < 1 || inputsBefore > 2 {
+		t.Fatalf("%d slow inputs ran before the last due check, want 1-2 (the input lane's share): %v", inputsBefore, order)
+	}
+	if order[0] != "noisy" || order[1] != "never" {
+		t.Fatalf("lanes did not alternate: %v", order[:2])
+	}
+	// Once the due lane drained, the inputs used the rest of the pass.
+	if inputs != slowInputs || len(order) != dueRules+slowInputs {
+		t.Fatalf("dispatched %d inputs of %d and %d rules of %d", inputs, slowInputs, len(order), dueRules+slowInputs)
+	}
 	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup WHERE workspace_id=$1 AND instruction='never' AND next_fire_at<=now()", f.WorkspaceID); n != 0 {
-		t.Fatalf("%d due checks were starved by slow inputs", n)
-	}
-	if slow < 2 || slow >= 10 {
-		t.Fatalf("slow inputs dispatched = %d, want the pass to be cut short after at least 2", slow)
-	}
-	if n := f.Count(t, "SELECT count(*) FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id WHERE w.issue_id=$1 AND r.processed_at IS NULL", issue); n != 10-slow {
-		t.Fatalf("pending inputs = %d, want %d left for the next pass", n, 10-slow)
+		t.Fatalf("%d due checks were left behind", n)
 	}
 }
 

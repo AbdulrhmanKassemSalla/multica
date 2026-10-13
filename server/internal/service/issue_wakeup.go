@@ -823,10 +823,14 @@ func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWak
 		cancel()
 	}
 	// Move the rule to the back of its lane so one noisy issue cannot
-	// monopolize the batches.
+	// monopolize the batches. Only scan order depends on this write: dispatch
+	// already committed the rule's outcome, and an unfinished rule stays a
+	// candidate either way. A pass now visits many more rules than one batch,
+	// so under load this bounded write can time out without anything being
+	// wrong; that is logged, not reported as a failed pass.
 	outcomeCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-	if touchErr := s.Tasks.Queries.TouchWakeupDispatch(outcomeCtx, w.ID); touchErr != nil {
-		errs = append(errs, touchErr)
+	if touchErr := s.Tasks.Queries.TouchWakeupDispatch(outcomeCtx, w.ID); touchErr != nil && ctx.Err() == nil {
+		slog.DebugContext(ctx, "issue wakeup: scan-order touch skipped", "wakeup_id", util.UUIDToString(w.ID), "error", touchErr)
 	}
 	cancel()
 	return errs
