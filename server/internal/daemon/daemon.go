@@ -6592,6 +6592,9 @@ func providerNeedsInlineSystemPrompt(provider string) bool {
 // Requiring the prior cwd as well would discard reachable history whenever a
 // local_directory task gets a new worktree (#9062). An empty or unavailable
 // store must still drop the resume, even when the cwd matches (#6806).
+// Codex also has a conversation-scoped store for local_directory tasks. A
+// continued worktree may use a new cwd while retaining its branch and rollout.
+// Managed Codex tasks still require the same existing directory.
 // sameExistingDir reports whether two paths name the same existing directory.
 // False when either cannot be stat'd, which is the safe answer for cwd-keyed
 // providers: an absent prior workdir means there is nothing to resume from.
@@ -6610,11 +6613,21 @@ func sameExistingDir(a, b string) bool {
 	return os.SameFile(ai, bi)
 }
 
-func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv, provider, envWorkDir string, sessionHomeReachable, refusesMissingSessionCwd bool, taskLog *slog.Logger) bool {
+// codexWorktreeResumeEligible permits a changed cwd only when the prepared
+// local_directory worktree continues this conversation's branch and Codex has
+// a stable conversation-scoped session store. In-place and managed tasks keep
+// the existing same-directory rule.
+func codexWorktreeResumeEligible(env *execenv.Environment, store string) bool {
+	return env != nil && env.LocalWorktree != nil && env.LocalWorktree.Continued && env.CodexHome != "" && store != ""
+}
+
+func gateResumeToReachableSession(task *Task, taskCtx *execenv.TaskContextForEnv, provider, envWorkDir string, sessionHomeReachable, refusesMissingSessionCwd, codexWorktreeResumeEligible bool, taskLog *slog.Logger) bool {
 	var reachable bool
 	if providerUsesPiSessionFile(provider) {
 		reachable = piSessionResumable(task.PriorSessionID, refusesMissingSessionCwd)
 	} else if provider == "hermes" {
+		reachable = sessionHomeReachable
+	} else if provider == "codex" && codexWorktreeResumeEligible {
 		reachable = sessionHomeReachable
 	} else {
 		// Compare the directories, not the spelling. Reuse runs in the canonical
@@ -8462,10 +8475,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		&task, &taskCtx, provider, env.WorkDir,
 		sessionHomeReachable(provider, env, envReused),
 		providerRefusesMissingSessionCwd(provider, !usesCustomProfileCommand),
+		provider == "codex" && codexWorktreeResumeEligible(env, execenv.CodexSessionStorePath(d.cfg.Profile, taskCtx)),
 		taskLog,
 	)
-	// A reused workdir is necessary but not sufficient for a Codex resume: the
-	// prior thread's rollout must actually be present in this task's CODEX_HOME
+	// A reachable workdir or continued local worktree is not sufficient for a
+	// Codex resume: the prior thread's rollout must be in this task's CODEX_HOME
 	// sessions (MUL-4424 isolates them). Drop the resume before the brief is
 	// generated below if it isn't, so we never tell the agent it is continuing a
 	// conversation Codex will silently restart from scratch.
