@@ -501,16 +501,18 @@ describe("ChatInput focusRequest", () => {
   });
 });
 
-describe("ChatInput conversation starter prefill", () => {
-  it("replaces live editor text and the stored draft", () => {
+describe("ChatInput conversation starter send", () => {
+  it("sends the chosen prompt immediately instead of the unfinished draft", async () => {
+    const onSend = vi.fn().mockResolvedValue(false);
     const onConversationStarterApplied = vi.fn();
-    const { rerender } = renderInput();
+    const { rerender } = renderInput({ onSend });
 
     fireEvent.change(screen.getByTestId("editor"), {
       target: { value: "unfinished local text" },
     });
     rerender(
       element({
+        onSend,
         conversationStarterRequest: {
           id: 1,
           content: "Review the release pull request.",
@@ -525,18 +527,99 @@ describe("ChatInput conversation starter prefill", () => {
     );
     expect(editorState.adopted).toEqual(["Review the release pull request."]);
     expect(onConversationStarterApplied).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    expect(onSend).toHaveBeenCalledWith(
+      "Review the release pull request.",
+      undefined,
+      expect.any(Function),
+      [],
+    );
   });
 
-  it("applies each request only once", () => {
+  it("sends each request only once across rerenders", async () => {
+    const onSend = vi.fn().mockResolvedValue(false);
     const request = {
       id: 1,
       content: "Review the release pull request.",
     };
-    const { rerender } = renderInput({ conversationStarterRequest: request });
+    const { rerender } = renderInput({ onSend, conversationStarterRequest: request });
 
-    rerender(element({ conversationStarterRequest: request }));
+    rerender(element({ onSend, conversationStarterRequest: request }));
 
     expect(editorState.adopted).toEqual([request.content]);
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps a rejected starter in the draft for manual retry", async () => {
+    const onSend = vi.fn().mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    const request = { id: 1, content: "Review the release pull request." };
+    renderInput({ onSend, conversationStarterRequest: request });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    const sendButton = screen.getByRole("button", { name: "Send" });
+    await waitFor(() => expect(sendButton).toBeEnabled());
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toBe(request.content);
+    expect(editorState.cleared).toBe(0);
+
+    fireEvent.click(sendButton);
+    await waitFor(() => expect(editorState.cleared).toBe(1));
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toBeUndefined();
+  });
+
+  it("ignores another starter while a send is pending", async () => {
+    let finishSend!: (accepted: boolean) => void;
+    const onSend = vi.fn(() => new Promise<boolean>((resolve) => { finishSend = resolve; }));
+    const first = { id: 1, content: "Review the release pull request." };
+    const second = { id: 2, content: "Deploy the release." };
+    const { rerender } = renderInput({ onSend, conversationStarterRequest: first });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledTimes(1));
+    rerender(element({ onSend, conversationStarterRequest: second }));
+    expect(editorState.adopted).toEqual([first.content]);
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toBe(first.content);
+
+    await act(async () => finishSend(true));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(editorState.cleared).toBe(1);
+  });
+
+  it.each([
+    { disabled: true },
+    { noAgent: true },
+    { isRunning: true, allowSubmitWhileRunning: false },
+  ])("does not replace a draft or defer a send when unavailable: %j", async (guard) => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    const request = { id: 1, content: "Deploy the release." };
+    useChatStore.getState().setInputDraft("__draft_new__", "unfinished local text");
+    const { rerender } = renderInput({ onSend, conversationStarterRequest: request, ...guard });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(editorState.adopted).toEqual([]);
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toBe("unfinished local text");
+    rerender(element({ onSend, conversationStarterRequest: request }));
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("does not defer a starter until an active upload finishes", async () => {
+    let finishUpload!: (result: UploadResult) => void;
+    mockApiUploadFile.mockImplementationOnce(() => new Promise<UploadResult>((resolve) => {
+      finishUpload = resolve;
+    }));
+    const onSend = vi.fn().mockResolvedValue(true);
+    const { rerender } = renderInput({ onSend });
+    act(() => dropHandlers.onDrop?.([new File(["x"], "image.png", { type: "image/png" })]));
+    const request = { id: 1, content: "Deploy the release." };
+    rerender(element({ onSend, conversationStarterRequest: request }));
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(editorState.adopted).toEqual([]);
+    await act(async () => finishUpload(makeUpload({
+      id: "att-1", link: "https://cdn.example/att-1.png", filename: "image.png",
+    })));
+    expect(onSend).not.toHaveBeenCalled();
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toContain("att-1.png");
   });
 });
 

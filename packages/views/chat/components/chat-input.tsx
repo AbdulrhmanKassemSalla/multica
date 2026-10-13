@@ -73,14 +73,14 @@ interface ChatInputProps {
      */
     sessionId?: string;
   } | null;
-  /** Explicit replacement requested by a conversation-starter button. Unlike a
-   * synchronized draft write, this may intentionally replace dirty editor
-   * content, so ChatInput adopts it after cancelling any pending debounce. */
+  /** One-click send requested by a conversation-starter button. ChatInput
+   * replaces the draft after cancelling its debounce, then uses the regular
+   * submit path so pending state, single-flight and failure recovery apply. */
   conversationStarterRequest?: {
     id: number;
     content: string;
   } | null;
-  /** Fired after the request has replaced both the stored and live draft. */
+  /** Consumes the request even when the composer cannot send right now. */
   onConversationStarterApplied?: () => void;
   /**
    * Fired when — and only when — the restore's content/attachments were written
@@ -377,32 +377,6 @@ export function ChatInput({
     editorRef.current?.focus();
   }, [focusRequest]);
 
-  // A conversation-starter click is an explicit replacement, not an ordinary
-  // external store sync. ContentEditor deliberately rejects external values
-  // while it has dirty local text, so adopting here prevents the old text's
-  // pending debounce from winning the race and overwriting the chosen prompt.
-  // Wait out active uploads: adopting content while an upload node is present
-  // would strand its completion callback.
-  useLayoutEffect(() => {
-    if (!conversationStarterRequest) return;
-    if (appliedConversationStarterIdRef.current === conversationStarterRequest.id) return;
-    if (editorDraftKeyRef.current !== draftKey) return;
-    if (editorRef.current?.hasActiveUploads() === true) return;
-
-    editorRef.current?.flushPendingUpdate();
-    appliedConversationStarterIdRef.current = conversationStarterRequest.id;
-    commitDraft(draftKey, conversationStarterRequest.content);
-    editorRef.current?.adoptContent(conversationStarterRequest.content);
-    setIsEmpty(!conversationStarterRequest.content.trim());
-    onConversationStarterApplied?.();
-  }, [
-    commitDraft,
-    draftKey,
-    onConversationStarterApplied,
-    conversationStarterRequest,
-    uploadGate.uploading,
-  ]);
-
   useEffect(() => {
     if (!restoreDraftRequest) {
       appliedRestoreIdRef.current = null;
@@ -577,6 +551,40 @@ export function ChatInput({
       return true;
     },
   });
+
+  // Consume each click once, including clicks while sending or uploading:
+  // replaying later could send after the user switches session or agent.
+  // Explicit adoption cancels dirty text's debounce before submit reads the
+  // editor. A rejected send keeps this prompt in the draft for manual retry.
+  useLayoutEffect(() => {
+    if (!conversationStarterRequest) return;
+    if (appliedConversationStarterIdRef.current === conversationStarterRequest.id) return;
+    appliedConversationStarterIdRef.current = conversationStarterRequest.id;
+    onConversationStarterApplied?.();
+    if (
+      submitting || disabled || noAgent ||
+      (isRunning && !allowSubmitWhileRunning) ||
+      editorDraftKeyRef.current !== draftKey || gate.isBlocked()
+    ) return;
+
+    editorRef.current?.flushPendingUpdate();
+    commitDraft(draftKey, conversationStarterRequest.content);
+    editorRef.current?.adoptContent(conversationStarterRequest.content);
+    setIsEmpty(!conversationStarterRequest.content.trim());
+    void submit();
+  }, [
+    allowSubmitWhileRunning,
+    commitDraft,
+    conversationStarterRequest,
+    disabled,
+    draftKey,
+    gate,
+    isRunning,
+    noAgent,
+    onConversationStarterApplied,
+    submit,
+    submitting,
+  ]);
 
   const placeholder = agentAccessRevoked
     ? t(($) => $.input.placeholder_access_revoked)

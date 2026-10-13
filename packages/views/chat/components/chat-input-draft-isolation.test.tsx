@@ -288,6 +288,25 @@ describe("ChatInput draft isolation across a composer switch (real debounce)", (
     vi.useRealTimers();
   });
 
+  it("sends a starter instead of dirty text without the old debounce restoring it", async () => {
+    mockSetContent.mockImplementationOnce((markdown: string) => {
+      editorState.markdown = markdown;
+    });
+    const onSend = vi.fn().mockResolvedValue(false);
+    const { rerender } = render(element({ onSend }));
+    type("unfinished local text");
+    const prompt = "Review the release pull request.";
+
+    rerender(element({ onSend, conversationStarterRequest: { id: 1, content: prompt } }));
+    await act(async () => {});
+    expect(onSend).toHaveBeenCalledWith(prompt, undefined, expect.any(Function), []);
+    expect(editorState.markdown).toBe(prompt);
+
+    act(() => { vi.advanceTimersByTime(1000); });
+    expect(store().inputDrafts["__new__"]).toBe(prompt);
+    expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
   it("files unflushed keystrokes under the session they were typed in, never the one switched to", () => {
     store().activeSessionId = "session-a";
     const { rerender } = render(element());
