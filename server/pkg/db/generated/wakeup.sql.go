@@ -1090,6 +1090,75 @@ func (q *Queries) ListPausedWakeupIssues(ctx context.Context, workspaceID pgtype
 	return items, nil
 }
 
+const listPendingWakeupInputGroups = `-- name: ListPendingWakeupInputGroups :many
+SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+  (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
+    AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
+  EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
+  (w.system_rule IS NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
+    AND t.agent_id=w.agent_id AND t.originator_user_id=w.created_by))::bool AS user_waiting,
+  min(r.created_at)::timestamptz AS oldest, count(*)::int AS inputs
+FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+WHERE r.processed_at IS NULL
+  AND ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
+GROUP BY 1,2,3,4,5,6
+ORDER BY oldest LIMIT 1000
+`
+
+type ListPendingWakeupInputGroupsRow struct {
+	WakeupID    pgtype.UUID        `json:"wakeup_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	SystemRule  bool               `json:"system_rule"`
+	Reserved    bool               `json:"reserved"`
+	OwnClaimed  bool               `json:"own_claimed"`
+	UserWaiting bool               `json:"user_waiting"`
+	Oldest      pgtype.Timestamptz `json:"oldest"`
+	Inputs      int32              `json:"inputs"`
+}
+
+// Scheduler observability over unprocessed inputs, grouped per rule and by
+// whether a run still reserves them. Dispatch deliberately keeps some inputs
+// pending while a run holds them; these flags mirror its checks:
+//
+//	reserved:     a claim reserved them for a run that has not started and has
+//	              not ended (takenReceipts). A run that ended without starting
+//	              releases them, and one that started has them consumed on the
+//	              next dispatch, so both are backlog.
+//	own_claimed:  the rule's own run is claimed (FindPendingWakeupTask).
+//	user_waiting: a queued run of the rule's agent, run as its creator, will
+//	              take them along (hasWaitingRun). Platform rules wait for the
+//	              issue's current target instead; the caller resolves that.
+//
+// Oldest groups first, bounded.
+func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, workspaceIds []pgtype.UUID) ([]ListPendingWakeupInputGroupsRow, error) {
+	rows, err := q.db.Query(ctx, listPendingWakeupInputGroups, workspaceIds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPendingWakeupInputGroupsRow{}
+	for rows.Next() {
+		var i ListPendingWakeupInputGroupsRow
+		if err := rows.Scan(
+			&i.WakeupID,
+			&i.IssueID,
+			&i.SystemRule,
+			&i.Reserved,
+			&i.OwnClaimed,
+			&i.UserWaiting,
+			&i.Oldest,
+			&i.Inputs,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingWakeupReceipts = `-- name: ListPendingWakeupReceipts :many
 SELECT id, wakeup_id, revision, event_key, event_type, payload, task_id, processed_at, created_at, coalesce_key FROM issue_wakeup_receipt WHERE wakeup_id= $1 AND revision= $2 AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE
 `
@@ -1609,40 +1678,6 @@ type PauseIssueWakeupParams struct {
 func (q *Queries) PauseIssueWakeup(ctx context.Context, arg PauseIssueWakeupParams) error {
 	_, err := q.db.Exec(ctx, pauseIssueWakeup, arg.PausedReason, arg.BlockRuns, arg.ID)
 	return err
-}
-
-const pendingWakeupInputs = `-- name: PendingWakeupInputs :one
-WITH pending AS (
- SELECT r.created_at,
-  (r.task_id IS NOT NULL
-   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')
-   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
-    AND (w.system_rule IS NOT NULL OR (t.agent_id=w.agent_id AND t.originator_user_id=w.created_by)))) AS held
- FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
- WHERE r.processed_at IS NULL
-  AND ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
-)
-SELECT (min(created_at) FILTER (WHERE NOT held))::timestamptz AS oldest_ready,
-       count(*) FILTER (WHERE held)::int AS held
-FROM pending
-`
-
-type PendingWakeupInputsRow struct {
-	OldestReady pgtype.Timestamptz `json:"oldest_ready"`
-	Held        int32              `json:"held"`
-}
-
-// Scheduler observability over unprocessed inputs. Dispatch deliberately
-// keeps some pending while a run holds them: inputs a claim reserved
-// (task_id), inputs of a rule whose own run is claimed, and inputs waiting to
-// join a queued run of the rule's agent on the issue (hasWaitingRun; for
-// platform rules any queued run on the issue counts). Those are counted as
-// held; the oldest of the rest is backlog the scheduler has not reached.
-func (q *Queries) PendingWakeupInputs(ctx context.Context, workspaceIds []pgtype.UUID) (PendingWakeupInputsRow, error) {
-	row := q.db.QueryRow(ctx, pendingWakeupInputs, workspaceIds)
-	var i PendingWakeupInputsRow
-	err := row.Scan(&i.OldestReady, &i.Held)
-	return i, err
 }
 
 const recordWakeupReceipt = `-- name: RecordWakeupReceipt :one

@@ -843,12 +843,12 @@ func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, input
 	if stop != "drained" {
 		level = slog.LevelWarn
 	}
-	ageCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
-	pending, err := s.Tasks.Queries.PendingWakeupInputs(ageCtx, nil)
+	pendingCtx, cancel := context.WithTimeout(ctx, time.Second)
+	pending, err := s.pendingInputs(pendingCtx, nil)
 	cancel()
 	if err == nil {
 		attrs = append(attrs, "held_inputs", pending.Held)
-		if age, ok := pendingInputAge(pending, time.Now()); ok {
+		if age, ok := pending.age(time.Now()); ok {
 			attrs = append(attrs, "oldest_ready_input_age_s", int64(age.Seconds()))
 			if age > wakeupPendingWarnAge {
 				level = slog.LevelWarn
@@ -858,13 +858,75 @@ func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, input
 	slog.Log(ctx, level, "issue wakeup dispatch pass", attrs...)
 }
 
-// pendingInputAge is how long the oldest input the scheduler could act on has
-// waited, if there is one.
-func pendingInputAge(p db.PendingWakeupInputsRow, now time.Time) (time.Duration, bool) {
+// pendingInputSummary splits unprocessed inputs into those a run is holding
+// on purpose and the backlog the scheduler could act on.
+type pendingInputSummary struct {
+	OldestReady pgtype.Timestamptz
+	Held        int
+}
+
+// age is how long the oldest actionable input has waited, if there is one.
+func (p pendingInputSummary) age(now time.Time) (time.Duration, bool) {
 	if !p.OldestReady.Valid {
 		return 0, false
 	}
 	return now.Sub(p.OldestReady.Time), true
+}
+
+// pendingInputs classifies unprocessed inputs the way dispatch treats them
+// (see ListPendingWakeupInputGroups). For a platform rule an input is held
+// only while a run of the issue's current target agent, run as the person the
+// platform rule's run would run as, waits to start: the same check
+// dispatchSystem makes before keeping its inputs.
+func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []pgtype.UUID) (pendingInputSummary, error) {
+	var out pendingInputSummary
+	q := s.Tasks.Queries
+	groups, err := q.ListPendingWakeupInputGroups(ctx, workspaceIDs)
+	if err != nil {
+		return out, err
+	}
+	systemWaiting := map[pgtype.UUID]bool{}
+	for _, g := range groups {
+		held := g.Reserved || g.OwnClaimed || g.UserWaiting
+		if !held && g.SystemRule {
+			waiting, known := systemWaiting[g.WakeupID]
+			if !known {
+				if waiting, err = s.systemRuleRunWaiting(ctx, q, g.IssueID); err != nil {
+					return out, err
+				}
+				systemWaiting[g.WakeupID] = waiting
+			}
+			held = waiting
+		}
+		switch {
+		case held:
+			out.Held += int(g.Inputs)
+		case !out.OldestReady.Valid || g.Oldest.Time.Before(out.OldestReady.Time):
+			out.OldestReady = g.Oldest
+		}
+	}
+	return out, nil
+}
+
+// systemRuleRunWaiting reports whether a platform rule on the issue would
+// keep its inputs for a run waiting to start (dispatchSystem's hasWaitingRun).
+func (s *IssueWakeupService) systemRuleRunWaiting(ctx context.Context, q *db.Queries, issueID pgtype.UUID) (bool, error) {
+	issue, err := q.GetIssue(ctx, issueID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	target, err := resolveWakeTarget(ctx, q, issue)
+	if err != nil || !target.Agent.ID.Valid {
+		return false, err
+	}
+	runAs, err := s.childDoneRunAs(ctx, issue, target.Agent)
+	if err != nil {
+		return false, err
+	}
+	return hasWaitingRun(ctx, q, issue.ID, target.Agent.ID, runAs.UserID)
 }
 
 func (s *IssueWakeupService) dispatch(ctx context.Context, prev db.IssueWakeup) error {

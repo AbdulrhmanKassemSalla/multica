@@ -95,26 +95,31 @@ SELECT w.* FROM candidates c JOIN issue_wakeup w ON w.id=c.id
 WHERE (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
   AND NOT (w.id = ANY(@skip_ids::uuid[]))
 ORDER BY w.updated_at,w.id LIMIT @row_limit;
--- name: PendingWakeupInputs :one
--- Scheduler observability over unprocessed inputs. Dispatch deliberately
--- keeps some pending while a run holds them: inputs a claim reserved
--- (task_id), inputs of a rule whose own run is claimed, and inputs waiting to
--- join a queued run of the rule's agent on the issue (hasWaitingRun; for
--- platform rules any queued run on the issue counts). Those are counted as
--- held; the oldest of the rest is backlog the scheduler has not reached.
-WITH pending AS (
- SELECT r.created_at,
-  (r.task_id IS NOT NULL
-   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')
-   OR EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
-    AND (w.system_rule IS NOT NULL OR (t.agent_id=w.agent_id AND t.originator_user_id=w.created_by)))) AS held
- FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
- WHERE r.processed_at IS NULL
+-- name: ListPendingWakeupInputGroups :many
+-- Scheduler observability over unprocessed inputs, grouped per rule and by
+-- whether a run still reserves them. Dispatch deliberately keeps some inputs
+-- pending while a run holds them; these flags mirror its checks:
+--  reserved:     a claim reserved them for a run that has not started and has
+--                not ended (takenReceipts). A run that ended without starting
+--                releases them, and one that started has them consumed on the
+--                next dispatch, so both are backlog.
+--  own_claimed:  the rule's own run is claimed (FindPendingWakeupTask).
+--  user_waiting: a queued run of the rule's agent, run as its creator, will
+--                take them along (hasWaitingRun). Platform rules wait for the
+--                issue's current target instead; the caller resolves that.
+-- Oldest groups first, bounded.
+SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+  (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
+    AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
+  EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
+  (w.system_rule IS NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
+    AND t.agent_id=w.agent_id AND t.originator_user_id=w.created_by))::bool AS user_waiting,
+  min(r.created_at)::timestamptz AS oldest, count(*)::int AS inputs
+FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+WHERE r.processed_at IS NULL
   AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
-)
-SELECT (min(created_at) FILTER (WHERE NOT held))::timestamptz AS oldest_ready,
-       count(*) FILTER (WHERE held)::int AS held
-FROM pending;
+GROUP BY 1,2,3,4,5,6
+ORDER BY oldest LIMIT 1000;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 

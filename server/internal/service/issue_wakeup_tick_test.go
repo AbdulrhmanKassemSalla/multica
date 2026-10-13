@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/dbid"
 )
 
 // idleConditionRules adds n enabled condition rules whose condition never
@@ -168,7 +169,8 @@ func TestWakeupTickSlowInputsLeaveTimeForDueChecks(t *testing.T) {
 }
 
 // Inputs a run holds on purpose are reported as held, not as backlog, so a
-// long-waiting run does not make every pass warn (PR #9202 review).
+// long-waiting run does not make every pass warn (PR #9202 review). Inputs no
+// run can take any more stay backlog, so a stalled wakeup still warns.
 func TestPendingWakeupInputsSeparatesHeldFromBacklog(t *testing.T) {
 	f, s, issue, agent := conditionFixture(t)
 	ctx := context.Background()
@@ -176,28 +178,103 @@ func TestPendingWakeupInputsSeparatesHeldFromBacklog(t *testing.T) {
 	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "follow up"})
 	f.Comment(t, issue.String(), "hello")
 	f.Exec(t, "UPDATE issue_wakeup_receipt SET created_at=now()-interval '10 minutes' WHERE wakeup_id=$1", w.ID)
-	read := func() db.PendingWakeupInputsRow {
+	read := func() pendingInputSummary {
 		t.Helper()
-		p, err := f.q.PendingWakeupInputs(ctx, ws)
+		p, err := s.pendingInputs(ctx, ws)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return p
 	}
-	p := read()
-	if age, ok := pendingInputAge(p, time.Now()); !ok || age < 9*time.Minute || p.Held != 0 {
-		t.Fatalf("unhandled input: age=%v ok=%v held=%d, want ~10m backlog", age, ok, p.Held)
+	backlog := func(why string) {
+		t.Helper()
+		p := read()
+		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute || p.Held != 0 {
+			t.Fatalf("%s: age=%v ok=%v held=%d, want ~10m backlog", why, age, ok, p.Held)
+		}
 	}
+	held := func(why string) {
+		t.Helper()
+		if p := read(); p.OldestReady.Valid || p.Held != 1 {
+			t.Fatalf("%s: %+v, want held", why, p)
+		}
+	}
+	backlog("unhandled input")
 	// A queued run of the agent for the rule's creator will take the input.
 	run := f.Task(t, agent, testutil.Cols{"issue_id": issue.String(), "originator_user_id": f.UserID, "accountable_user_id": f.UserID,
 		"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
-	if p = read(); p.OldestReady.Valid || p.Held != 1 {
-		t.Fatalf("input waiting for a queued run: %+v, want held", p)
-	}
-	// An input a claim reserved stays held after the run leaves the queue.
+	held("input waiting for a queued run")
+	// A claim reserved the input for that run, which has not started yet.
 	f.Exec(t, "UPDATE agent_task_queue SET status='dispatched' WHERE id=$1", run)
 	f.Exec(t, "UPDATE issue_wakeup_receipt SET task_id=$2 WHERE wakeup_id=$1", w.ID, run)
-	if p = read(); p.OldestReady.Valid || p.Held != 1 {
-		t.Fatalf("reserved input: %+v, want held", p)
+	held("input reserved by a claimed run")
+	// The run ended without starting: dispatch releases the input, so nobody
+	// holds it any more.
+	f.Exec(t, "UPDATE agent_task_queue SET status='cancelled', completed_at=now() WHERE id=$1", run)
+	backlog("input reserved by a run cancelled before it started")
+	f.Exec(t, "UPDATE agent_task_queue SET status='failed', completed_at=now() WHERE id=$1", run)
+	backlog("input reserved by a run that failed before it started")
+	// The run started: the next dispatch consumes the input.
+	f.Exec(t, "UPDATE agent_task_queue SET status='running', started_at=now(), completed_at=NULL WHERE id=$1", run)
+	backlog("input of a run that already started")
+}
+
+// A platform rule's input is held only by a run waiting for the issue's
+// current target, run as that rule's run would be, not by any queued run on
+// the issue (PR #9202 review).
+func TestPendingWakeupInputsSystemRuleHeldOnlyByItsTarget(t *testing.T) {
+	f, s, issue, target := conditionFixture(t)
+	ctx := context.Background()
+	ws := []pgtype.UUID{parseTestUUID(t, f.WorkspaceID)}
+	var owner string
+	f.QueryRow(t, "SELECT owner_id::text FROM agent WHERE id=$1", target).Scan(&owner)
+	other := f.privateAgentOwnedBy(t, owner, "other")
+	f.Exec(t, "UPDATE issue SET assignee_type='agent', assignee_id=$2 WHERE id=$1", issue, target)
+	rule, err := f.q.CreateSystemWakeup(ctx, db.CreateSystemWakeupParams{ID: dbid.NewV7(), WorkspaceID: ws[0], IssueID: issue,
+		EventTypes: []string{"issue.status_changed"}, Condition: childDoneCondition, Enabled: true, SystemRule: systemRuleText(SystemRuleChildDone)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload,created_at)
+		VALUES(gen_random_uuid(),$1,$2,'k','condition.met','{}',now()-interval '10 minutes')`, rule.ID, rule.Revision)
+	read := func() pendingInputSummary {
+		t.Helper()
+		p, err := s.pendingInputs(ctx, ws)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	queued := func(agent, runAs string) string {
+		t.Helper()
+		return f.Task(t, agent, testutil.Cols{"issue_id": issue.String(), "originator_user_id": runAs, "accountable_user_id": runAs,
+			"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
+	}
+	issueRow, err := f.q.GetIssue(ctx, issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetAgent, err := f.q.GetAgentInWorkspace(ctx, db.GetAgentInWorkspaceParams{ID: parseTestUUID(t, target), WorkspaceID: ws[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runAs, err := s.childDoneRunAs(ctx, issueRow, targetAgent)
+	if err != nil || !runAs.UserID.Valid {
+		t.Fatalf("run-as for the target: %+v %v", runAs, err)
+	}
+	// Another agent's queued run cannot take a platform rule's input.
+	queued(other, runAs.UserID.String())
+	if p := read(); !p.OldestReady.Valid || p.Held != 0 {
+		t.Fatalf("input with only another agent's run queued: %+v, want backlog", p)
+	}
+	// Nor can the target's run as somebody else.
+	stranger := queued(target, f.member(t, "someone-else"))
+	if p := read(); !p.OldestReady.Valid || p.Held != 0 {
+		t.Fatalf("input with the target's run as another person: %+v, want backlog", p)
+	}
+	f.Exec(t, "UPDATE agent_task_queue SET status='cancelled', completed_at=now() WHERE id=$1", stranger)
+	queued(target, runAs.UserID.String())
+	if p := read(); p.OldestReady.Valid || p.Held != 1 {
+		t.Fatalf("input with the target's run queued: %+v, want held", p)
 	}
 }
