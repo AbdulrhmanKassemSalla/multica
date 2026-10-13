@@ -3,6 +3,7 @@
 import type { ReactNode } from "react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { TriangleAlert } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@multica/ui/lib/utils";
 import {
   ContentEditor,
@@ -74,8 +75,8 @@ interface ChatInputProps {
     sessionId?: string;
   } | null;
   /** One-click send requested by a conversation-starter button. ChatInput
-   * replaces the draft after cancelling its debounce, then uses the regular
-   * submit path so pending state, single-flight and failure recovery apply. */
+   * adopts the prompt only when there is no draft in progress, then uses the
+   * regular submit path for pending state, single-flight and failure recovery. */
   conversationStarterRequest?: {
     id: number;
     content: string;
@@ -554,8 +555,9 @@ export function ChatInput({
 
   // Consume each click once, including clicks while sending or uploading:
   // replaying later could send after the user switches session or agent.
-  // Explicit adoption cancels dirty text's debounce before submit reads the
-  // editor. A rejected send keeps this prompt in the draft for manual retry.
+  // Keep existing text and attachments intact. Flush first so the draft check
+  // sees typing still in the debounce window. A rejected send keeps the
+  // starter prompt in the draft for manual retry.
   useLayoutEffect(() => {
     if (!conversationStarterRequest) return;
     if (appliedConversationStarterIdRef.current === conversationStarterRequest.id) return;
@@ -564,10 +566,24 @@ export function ChatInput({
     if (
       submitting || disabled || noAgent ||
       (isRunning && !allowSubmitWhileRunning) ||
-      editorDraftKeyRef.current !== draftKey || gate.isBlocked()
+      editorDraftKeyRef.current !== draftKey
     ) return;
+    if (gate.isBlocked()) {
+      toast.info(t(($) => $.conversation_starters.uploading));
+      return;
+    }
 
-    editorRef.current?.flushPendingUpdate();
+    const pending = editorRef.current?.flushPendingUpdate();
+    if (pending != null) commitDraft(draftKey, pending);
+    const draft = useChatStore.getState();
+    if (
+      editorRef.current?.getMarkdown().trim() ||
+      (draft.inputDrafts[draftKey] ?? "").trim() ||
+      (draft.inputDraftAttachments[draftKey]?.length ?? 0) > 0
+    ) {
+      toast.info(t(($) => $.conversation_starters.draft_in_progress));
+      return;
+    }
     commitDraft(draftKey, conversationStarterRequest.content);
     editorRef.current?.adoptContent(conversationStarterRequest.content);
     setIsEmpty(!conversationStarterRequest.content.trim());
@@ -584,6 +600,7 @@ export function ChatInput({
     onConversationStarterApplied,
     submit,
     submitting,
+    t,
   ]);
 
   const placeholder = agentAccessRevoked

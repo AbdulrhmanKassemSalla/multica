@@ -13,6 +13,10 @@ import enEditor from "../../locales/en/editor.json";
 // mocking that call; it resolves a server Attachment row (makeUpload's extra
 // link/markdownLink fields are ignored by the engine, which re-derives them).
 const mockApiUploadFile = vi.hoisted(() => vi.fn());
+const mockToastInfo = vi.hoisted(() => vi.fn());
+vi.mock("sonner", () => ({
+  toast: Object.assign(vi.fn(), { info: mockToastInfo, error: vi.fn(), success: vi.fn() }),
+}));
 // Observability for the write-back insert path: a settle whose mount died
 // delivers into the live editor through this method.
 const insertMarkdownSpy = vi.hoisted(() => vi.fn());
@@ -353,6 +357,7 @@ beforeEach(() => {
     delete state.inputDraftAttachments[key];
   });
   mockApiUploadFile.mockReset();
+  mockToastInfo.mockClear();
   mockApiUploadFile.mockImplementation(async () =>
     makeUpload({ id: "att-1", link: "https://cdn.example/att-1.png", filename: "img.png" }),
   );
@@ -502,14 +507,11 @@ describe("ChatInput focusRequest", () => {
 });
 
 describe("ChatInput conversation starter send", () => {
-  it("sends the chosen prompt immediately instead of the unfinished draft", async () => {
+  it("sends the chosen prompt immediately from an empty draft", async () => {
     const onSend = vi.fn().mockResolvedValue(false);
     const onConversationStarterApplied = vi.fn();
     const { rerender } = renderInput({ onSend });
 
-    fireEvent.change(screen.getByTestId("editor"), {
-      target: { value: "unfinished local text" },
-    });
     rerender(
       element({
         onSend,
@@ -534,6 +536,33 @@ describe("ChatInput conversation starter send", () => {
       expect.any(Function),
       [],
     );
+  });
+
+  it("preserves an existing draft and explains why the starter was not sent", async () => {
+    const onSend = vi.fn().mockResolvedValue(true);
+    const { rerender } = renderInput({ onSend });
+    fireEvent.change(screen.getByTestId("editor"), {
+      target: { value: "unfinished local text" },
+    });
+    rerender(element({ onSend, conversationStarterRequest: { id: 1, content: "Deploy the release." } }));
+
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+    expect(editorState.adopted).toEqual([]);
+    expect(useChatStore.getState().inputDrafts["__draft_new__"]).toBe("unfinished local text");
+    expect(mockToastInfo).toHaveBeenCalledWith("Send or clear your draft before using a starter.");
+  });
+
+  it("preserves staged attachments even when the draft text is empty", async () => {
+    const attachment = makeUpload({ id: "att-1", link: "https://cdn.example/att-1.png", filename: "image.png" });
+    const staged = { clientUploadId: "upload-1", status: "uploaded", filename: "image.png", size: 1, attachment } as DraftUpload;
+    useChatStore.getState().setInputDraftAttachments("__draft_new__", [staged]);
+    const { onSend } = renderInput({ conversationStarterRequest: { id: 1, content: "Deploy the release." } });
+
+    await act(async () => {});
+    expect(onSend).not.toHaveBeenCalled();
+    expect(useChatStore.getState().inputDraftAttachments["__draft_new__"]).toEqual([staged]);
+    expect(mockToastInfo).toHaveBeenCalledWith("Send or clear your draft before using a starter.");
   });
 
   it("sends each request only once across rerenders", async () => {
@@ -615,6 +644,7 @@ describe("ChatInput conversation starter send", () => {
 
     expect(onSend).not.toHaveBeenCalled();
     expect(editorState.adopted).toEqual([]);
+    expect(mockToastInfo).toHaveBeenCalledWith("Wait for uploads to finish before using a starter.");
     await act(async () => finishUpload(makeUpload({
       id: "att-1", link: "https://cdn.example/att-1.png", filename: "image.png",
     })));
