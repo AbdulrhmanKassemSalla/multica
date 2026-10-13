@@ -1091,19 +1091,32 @@ func (q *Queries) ListPausedWakeupIssues(ctx context.Context, workspaceID pgtype
 }
 
 const listPendingWakeupInputGroups = `-- name: ListPendingWakeupInputGroups :many
-SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+WITH groups AS (
+ SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
   (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
     AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
   EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
   (w.system_rule IS NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
     AND t.agent_id=w.agent_id AND t.originator_user_id=w.created_by))::bool AS user_waiting,
   min(r.created_at)::timestamptz AS oldest, count(*)::int AS inputs
-FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
-WHERE r.processed_at IS NULL
-  AND ($1::uuid[] IS NULL OR w.workspace_id = ANY($1::uuid[]))
-GROUP BY 1,2,3,4,5,6
-ORDER BY oldest LIMIT 1000
+ FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+ WHERE r.processed_at IS NULL
+  AND ($5::uuid[] IS NULL OR w.workspace_id = ANY($5::uuid[]))
+ GROUP BY 1,2,3,4,5,6
+)
+SELECT g.wakeup_id, g.issue_id, g.system_rule, g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
+WHERE $1::timestamptz IS NULL
+   OR (g.oldest, g.wakeup_id, g.reserved) > ($1::timestamptz, $2::uuid, $3::bool)
+ORDER BY g.oldest, g.wakeup_id, g.reserved LIMIT $4
 `
+
+type ListPendingWakeupInputGroupsParams struct {
+	AfterOldest   pgtype.Timestamptz `json:"after_oldest"`
+	AfterWakeupID pgtype.UUID        `json:"after_wakeup_id"`
+	AfterReserved bool               `json:"after_reserved"`
+	PageSize      int32              `json:"page_size"`
+	WorkspaceIds  []pgtype.UUID      `json:"workspace_ids"`
+}
 
 type ListPendingWakeupInputGroupsRow struct {
 	WakeupID    pgtype.UUID        `json:"wakeup_id"`
@@ -1129,9 +1142,17 @@ type ListPendingWakeupInputGroupsRow struct {
 //	              take them along (hasWaitingRun). Platform rules wait for the
 //	              issue's current target instead; the caller resolves that.
 //
-// Oldest groups first, bounded.
-func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, workspaceIds []pgtype.UUID) ([]ListPendingWakeupInputGroupsRow, error) {
-	rows, err := q.db.Query(ctx, listPendingWakeupInputGroups, workspaceIds)
+// Oldest groups first, one page at a time: the caller pages with the last
+// group's (oldest, wakeup_id, reserved) until a short page, so no group is
+// left unread however many there are.
+func (q *Queries) ListPendingWakeupInputGroups(ctx context.Context, arg ListPendingWakeupInputGroupsParams) ([]ListPendingWakeupInputGroupsRow, error) {
+	rows, err := q.db.Query(ctx, listPendingWakeupInputGroups,
+		arg.AfterOldest,
+		arg.AfterWakeupID,
+		arg.AfterReserved,
+		arg.PageSize,
+		arg.WorkspaceIds,
+	)
 	if err != nil {
 		return nil, err
 	}

@@ -838,29 +838,43 @@ func (s *IssueWakeupService) dispatchFromTick(ctx context.Context, w db.IssueWak
 
 // logTick reports one global pass: how many rules each lane visited, how long
 // the pass took and why it stopped, plus the age of the oldest input the
-// scheduler could act on and how many inputs a run is holding. A pass cut
-// short by a limit, or an actionable input waiting longer than
-// wakeupPendingWarnAge, logs at warn level; held inputs never do.
+// scheduler could act on and how many inputs a run is holding. It logs at
+// warn level when a limit cut the pass short, a dispatch failed, an
+// actionable input has waited longer than wakeupPendingWarnAge, or the
+// pending scan could not finish (pending_scan=incomplete: the age may be
+// missing or too young, so silence must not be read as "no backlog").
+// Held inputs never warn on their own.
 func (s *IssueWakeupService) logTick(ctx context.Context, start time.Time, inputs, due int, stop string, failures int) {
 	attrs := []any{"input_rules", inputs, "due_rules", due, "duration_ms", time.Since(start).Milliseconds(), "stopped", stop, "failures", failures}
 	level := slog.LevelInfo
-	if stop != "drained" {
+	if stop != "drained" || failures > 0 {
 		level = slog.LevelWarn
 	}
-	pendingCtx, cancel := context.WithTimeout(ctx, time.Second)
-	pending, err := s.pendingInputs(pendingCtx, nil)
+	pendingCtx, cancel := context.WithTimeout(ctx, wakeupPendingScanBudget)
+	pending, err := s.pendingInputs(pendingCtx, nil, wakeupPendingScanPage)
 	cancel()
-	if err == nil {
-		attrs = append(attrs, "held_inputs", pending.Held)
-		if age, ok := pending.age(time.Now()); ok {
-			attrs = append(attrs, "oldest_ready_input_age_s", int64(age.Seconds()))
-			if age > wakeupPendingWarnAge {
-				level = slog.LevelWarn
-			}
+	attrs = append(attrs, "held_inputs", pending.Held)
+	if err != nil {
+		attrs = append(attrs, "pending_scan", "incomplete", "pending_scan_error", err.Error())
+		level = slog.LevelWarn
+	} else {
+		attrs = append(attrs, "pending_scan", "complete")
+	}
+	if age, ok := pending.age(time.Now()); ok {
+		attrs = append(attrs, "oldest_ready_input_age_s", int64(age.Seconds()))
+		if age > wakeupPendingWarnAge {
+			level = slog.LevelWarn
 		}
 	}
 	slog.Log(ctx, level, "issue wakeup dispatch pass", attrs...)
 }
+
+// The pending scan reads every group of unprocessed inputs, a page at a time,
+// within this budget. A scan that runs out of it reports itself incomplete.
+const (
+	wakeupPendingScanBudget = 3 * time.Second
+	wakeupPendingScanPage   = 1000
+)
 
 // pendingInputSummary splits unprocessed inputs into those a run is holding
 // on purpose and the backlog the scheduler could act on.
@@ -877,39 +891,49 @@ func (p pendingInputSummary) age(now time.Time) (time.Duration, bool) {
 	return now.Sub(p.OldestReady.Time), true
 }
 
-// pendingInputs classifies unprocessed inputs the way dispatch treats them
-// (see ListPendingWakeupInputGroups). For a platform rule an input is held
-// only while a run of the issue's current target agent, run as the person the
-// platform rule's run would run as, waits to start: the same check
-// dispatchSystem makes before keeping its inputs.
-func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []pgtype.UUID) (pendingInputSummary, error) {
+// pendingInputs classifies every unprocessed input the way dispatch treats
+// it (see ListPendingWakeupInputGroups), paging until the groups run out. For
+// a platform rule an input is held only while a run of the issue's current
+// target agent, run as the person the platform rule's run would run as, waits
+// to start: the same check dispatchSystem makes before keeping its inputs.
+//
+// On an error, including ctx running out, it returns what it read so far
+// with the error: the summary is then a lower bound, not the answer.
+func (s *IssueWakeupService) pendingInputs(ctx context.Context, workspaceIDs []pgtype.UUID, pageSize int) (pendingInputSummary, error) {
 	var out pendingInputSummary
 	q := s.Tasks.Queries
-	groups, err := q.ListPendingWakeupInputGroups(ctx, workspaceIDs)
-	if err != nil {
-		return out, err
-	}
 	systemWaiting := map[pgtype.UUID]bool{}
-	for _, g := range groups {
-		held := g.Reserved || g.OwnClaimed || g.UserWaiting
-		if !held && g.SystemRule {
-			waiting, known := systemWaiting[g.WakeupID]
-			if !known {
-				if waiting, err = s.systemRuleRunWaiting(ctx, q, g.IssueID); err != nil {
-					return out, err
+	params := db.ListPendingWakeupInputGroupsParams{WorkspaceIds: workspaceIDs, PageSize: int32(pageSize)}
+	for {
+		groups, err := q.ListPendingWakeupInputGroups(ctx, params)
+		if err != nil {
+			return out, fmt.Errorf("list pending wakeup inputs: %w", err)
+		}
+		for _, g := range groups {
+			held := g.Reserved || g.OwnClaimed || g.UserWaiting
+			if !held && g.SystemRule {
+				waiting, known := systemWaiting[g.IssueID]
+				if !known {
+					if waiting, err = s.systemRuleRunWaiting(ctx, q, g.IssueID); err != nil {
+						return out, fmt.Errorf("resolve platform rule target: %w", err)
+					}
+					systemWaiting[g.IssueID] = waiting
 				}
-				systemWaiting[g.WakeupID] = waiting
+				held = waiting
 			}
-			held = waiting
+			switch {
+			case held:
+				out.Held += int(g.Inputs)
+			case !out.OldestReady.Valid || g.Oldest.Time.Before(out.OldestReady.Time):
+				out.OldestReady = g.Oldest
+			}
 		}
-		switch {
-		case held:
-			out.Held += int(g.Inputs)
-		case !out.OldestReady.Valid || g.Oldest.Time.Before(out.OldestReady.Time):
-			out.OldestReady = g.Oldest
+		if len(groups) < pageSize {
+			return out, nil
 		}
+		last := groups[len(groups)-1]
+		params.AfterOldest, params.AfterWakeupID, params.AfterReserved = last.Oldest, last.WakeupID, last.Reserved
 	}
-	return out, nil
 }
 
 // systemRuleRunWaiting reports whether a platform rule on the issue would

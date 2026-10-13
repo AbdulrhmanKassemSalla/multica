@@ -203,7 +203,7 @@ func TestPendingWakeupInputsSeparatesHeldFromBacklog(t *testing.T) {
 	f.Exec(t, "UPDATE issue_wakeup_receipt SET created_at=now()-interval '10 minutes' WHERE wakeup_id=$1", w.ID)
 	read := func() pendingInputSummary {
 		t.Helper()
-		p, err := s.pendingInputs(ctx, ws)
+		p, err := s.pendingInputs(ctx, ws, wakeupPendingScanPage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -262,7 +262,7 @@ func TestPendingWakeupInputsSystemRuleHeldOnlyByItsTarget(t *testing.T) {
 		VALUES(gen_random_uuid(),$1,$2,'k','condition.met','{}',now()-interval '10 minutes')`, rule.ID, rule.Revision)
 	read := func() pendingInputSummary {
 		t.Helper()
-		p, err := s.pendingInputs(ctx, ws)
+		p, err := s.pendingInputs(ctx, ws, wakeupPendingScanPage)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -299,5 +299,55 @@ func TestPendingWakeupInputsSystemRuleHeldOnlyByItsTarget(t *testing.T) {
 	queued(target, runAs.UserID.String())
 	if p := read(); p.OldestReady.Valid || p.Held != 1 {
 		t.Fatalf("input with the target's run queued: %+v, want held", p)
+	}
+}
+
+// More held groups than one page must not hide the ready input behind them
+// (PR #9202 review): the scan pages until the groups run out.
+func TestPendingWakeupInputsScansPastAFullPageOfHeldGroups(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	ctx := context.Background()
+	ws := []pgtype.UUID{parseTestUUID(t, f.WorkspaceID)}
+	// A page of turned-off rules whose inputs a queued run will take along.
+	seed := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "held"})
+	f.Exec(t, "UPDATE issue_wakeup SET enabled=false, disabled_at=now() WHERE id=$1", seed.ID)
+	cloneWakeup(t, f, seed.ID, wakeupPendingScanPage-1, true)
+	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload,created_at)
+		SELECT gen_random_uuid(),id,revision,'k','comment.created','{}',now()-interval '20 minutes' FROM issue_wakeup WHERE issue_id=$1`, issue)
+	f.Task(t, agent, testutil.Cols{"issue_id": issue.String(), "originator_user_id": f.UserID, "accountable_user_id": f.UserID,
+		"runtime_id": testutil.Raw("(SELECT runtime_id FROM agent WHERE id='" + agent + "')")})
+	// One ready input, younger than every held one, on another issue.
+	other := parseTestUUID(t, f.Issue(t, "Ready input"))
+	f.Cleanup(t, "DELETE FROM issue_wakeup WHERE issue_id=$1", other)
+	f.Cleanup(t, "DELETE FROM issue_wakeup_receipt WHERE wakeup_id IN (SELECT id FROM issue_wakeup WHERE issue_id=$1)", other)
+	f.Cleanup(t, "DELETE FROM activity_log WHERE issue_id=$1", other)
+	ready := wakeCreate(t, f, s, other, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "ready"})
+	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload,created_at)
+		VALUES(gen_random_uuid(),$1,$2,'k','comment.created','{}',now()-interval '10 minutes')`, ready.ID, ready.Revision)
+
+	for _, page := range []int{wakeupPendingScanPage, 7} {
+		p, err := s.pendingInputs(ctx, ws, page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p.Held != wakeupPendingScanPage {
+			t.Fatalf("page %d: held = %d, want %d", page, p.Held, wakeupPendingScanPage)
+		}
+		if age, ok := p.age(time.Now()); !ok || age < 9*time.Minute || age > 15*time.Minute {
+			t.Fatalf("page %d: ready input behind the held page: age=%v ok=%v", page, age, ok)
+		}
+	}
+}
+
+// A scan that cannot finish says so instead of returning a silent summary.
+func TestPendingWakeupInputsReportsAnIncompleteScan(t *testing.T) {
+	f, s, issue, agent := conditionFixture(t)
+	w := wakeCreate(t, f, s, issue, WakeupInput{AgentID: agent, Kind: "event", Mode: "continuous", EventTypes: []string{"comment.created"}, Instruction: "follow up"})
+	f.Exec(t, `INSERT INTO issue_wakeup_receipt(id,wakeup_id,revision,event_key,event_type,payload)
+		VALUES(gen_random_uuid(),$1,$2,'k','comment.created','{}')`, w.ID, w.Revision)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := s.pendingInputs(ctx, []pgtype.UUID{parseTestUUID(t, f.WorkspaceID)}, wakeupPendingScanPage); err == nil {
+		t.Fatal("a scan whose context ended reported a complete result")
 	}
 }

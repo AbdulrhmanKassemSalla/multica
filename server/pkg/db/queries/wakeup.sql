@@ -107,19 +107,26 @@ ORDER BY w.updated_at,w.id LIMIT @row_limit;
 --  user_waiting: a queued run of the rule's agent, run as its creator, will
 --                take them along (hasWaitingRun). Platform rules wait for the
 --                issue's current target instead; the caller resolves that.
--- Oldest groups first, bounded.
-SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
+-- Oldest groups first, one page at a time: the caller pages with the last
+-- group's (oldest, wakeup_id, reserved) until a short page, so no group is
+-- left unread however many there are.
+WITH groups AS (
+ SELECT w.id AS wakeup_id, w.issue_id, (w.system_rule IS NOT NULL)::bool AS system_rule,
   (r.task_id IS NOT NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.id=r.task_id
     AND t.started_at IS NULL AND t.status NOT IN ('running','completed','failed','cancelled')))::bool AS reserved,
   EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.context->>'wakeup_id'=w.id::text AND t.status='dispatched')::bool AS own_claimed,
   (w.system_rule IS NULL AND EXISTS (SELECT 1 FROM agent_task_queue t WHERE t.issue_id=w.issue_id AND t.status='queued'
     AND t.agent_id=w.agent_id AND t.originator_user_id=w.created_by))::bool AS user_waiting,
   min(r.created_at)::timestamptz AS oldest, count(*)::int AS inputs
-FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
-WHERE r.processed_at IS NULL
+ FROM issue_wakeup_receipt r JOIN issue_wakeup w ON w.id=r.wakeup_id
+ WHERE r.processed_at IS NULL
   AND (sqlc.narg('workspace_ids')::uuid[] IS NULL OR w.workspace_id = ANY(sqlc.narg('workspace_ids')::uuid[]))
-GROUP BY 1,2,3,4,5,6
-ORDER BY oldest LIMIT 1000;
+ GROUP BY 1,2,3,4,5,6
+)
+SELECT g.wakeup_id, g.issue_id, g.system_rule, g.reserved, g.own_claimed, g.user_waiting, g.oldest, g.inputs FROM groups g
+WHERE sqlc.narg('after_oldest')::timestamptz IS NULL
+   OR (g.oldest, g.wakeup_id, g.reserved) > (sqlc.narg('after_oldest')::timestamptz, @after_wakeup_id::uuid, @after_reserved::bool)
+ORDER BY g.oldest, g.wakeup_id, g.reserved LIMIT @page_size;
 -- name: ListPendingWakeupReceipts :many
 SELECT * FROM issue_wakeup_receipt WHERE wakeup_id= @wakeup_id AND revision= @revision AND processed_at IS NULL ORDER BY created_at,id LIMIT 100 FOR UPDATE;
 
