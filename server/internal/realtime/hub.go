@@ -289,15 +289,19 @@ type SubscriptionCallback func(scopeType, scopeID string)
 
 // Hub manages WebSocket connections organized into scope-based rooms.
 type Hub struct {
-	rooms               map[scopeKey]map[*Client]bool
-	clients             map[*Client]bool // every connected client (used by global Broadcast and snapshots)
-	broadcast           chan []byte
-	register            chan *Client
-	unregister          chan *Client
-	mu                  sync.RWMutex
-	membership          MembershipChecker // guarded by mu
-	writeMembership     chan membershipWriteRequest
-	writeMembershipOnce sync.Once
+	rooms                map[scopeKey]map[*Client]bool
+	clients              map[*Client]bool // every connected client (used by global Broadcast and snapshots)
+	broadcast            chan []byte
+	register             chan *Client
+	unregister           chan *Client
+	mu                   sync.RWMutex
+	membership           MembershipChecker // guarded by mu
+	writeMembership      chan membershipWriteRequest
+	writeMembershipOnce  sync.Once
+	memberRemovals       chan memberRemovalJob
+	memberRemovalOnce    sync.Once
+	memberRemovalPending atomic.Int64
+	memberRemovalDropped atomic.Int64
 
 	authorizer ScopeAuthorizer
 
@@ -315,6 +319,7 @@ func NewHub() *Hub {
 		register:        make(chan *Client),
 		unregister:      make(chan *Client),
 		writeMembership: make(chan membershipWriteRequest, maxMembershipBatch),
+		memberRemovals:  make(chan memberRemovalJob, memberRemovalQueueSize),
 	}
 }
 
@@ -508,22 +513,25 @@ func (h *Hub) BroadcastToScopeDedup(scopeType, scopeID string, message []byte, e
 	}
 	// Both the local fast path and every relay backend converge here. A
 	// replayed removal is meaningful only while the user is still absent.
-	var excludeUserID string
-	if scopeType == ScopeWorkspace {
-		var forward bool
-		excludeUserID, forward = h.applyMemberRemoval(scopeID, message)
-		if !forward {
-			return
-		}
+	if scopeType == ScopeWorkspace && h.queueMemberRemoval(scopeID, message, eventID) {
+		return
 	}
+	h.broadcastToScope(scopeType, scopeID, message, eventID, "", nil)
+}
+
+func (h *Hub) broadcastToScope(scopeType, scopeID string, message []byte, eventID, excludeUserID string, snapshot map[*Client]bool) {
 	key := sk(scopeType, scopeID)
 
 	h.mu.RLock()
-	clients := h.rooms[key]
+	room := h.rooms[key]
+	clients := snapshot
+	if clients == nil {
+		clients = room
+	}
 	var slow []*Client
 	var sent int64
 	for client := range clients {
-		if excludeUserID != "" && client.userID == excludeUserID {
+		if !room[client] || (excludeUserID != "" && client.userID == excludeUserID) {
 			continue
 		}
 		if !client.markSeen(eventID) {
@@ -687,8 +695,10 @@ func (h *Hub) Snapshot() map[string]any {
 		rooms[key.Type]++
 	}
 	return map[string]any{
-		"connections": len(h.clients),
-		"rooms":       rooms,
+		"connections":                       len(h.clients),
+		"rooms":                             rooms,
+		"membership_removals_pending":       h.memberRemovalPending.Load(),
+		"membership_removals_dropped_total": h.memberRemovalDropped.Load(),
 	}
 }
 

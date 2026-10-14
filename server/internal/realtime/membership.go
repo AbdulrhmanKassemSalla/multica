@@ -69,46 +69,38 @@ func (h *Hub) DisconnectMember(workspaceID, userID, memberID string) {
 		"type":    "member:removed",
 		"payload": map[string]string{"workspace_id": workspaceID, "user_id": userID, "member_id": memberID},
 	})
-	h.disconnectMember(workspaceID, userID, notice)
+	job := h.snapshotMemberRemoval(workspaceID, userID)
+	if len(job.clients) == 0 {
+		return
+	}
+	job.notice = notice
+	h.disconnectMember(job)
 }
 
 // Returns false when a removal notification is stale or cannot be verified.
-func (h *Hub) disconnectMember(workspaceID, userID string, notice []byte) bool {
-	h.mu.RLock()
-	checker := h.membership
-	var clients []*Client
-	for client := range h.clients {
-		if client.workspaceID == workspaceID && client.userID == userID {
-			clients = append(clients, client)
-		}
-	}
-	h.mu.RUnlock()
-	// Close the connection snapshot before querying membership. A new
-	// connection registered during the lookup must not inherit its old result;
-	// its own writer will check current membership before sending content.
-	member, err := checkMembership(checker, userID, workspaceID)
+func (h *Hub) disconnectMember(job memberRemovalJob) bool {
+	member, err := checkMembership(job.checker, job.userID, job.workspaceID)
 	if err == nil && member {
 		return false
 	}
 	if err != nil {
-		notice = nil
+		job.notice = nil
 	}
 	// One total deadline bounds notification attempts across all sockets. An
 	// idle writer can send the existing client navigation signal; busy/slow
 	// writers are closed immediately instead of draining content first.
 	deadline := time.Now().Add(removalNoticeWait)
-	for _, client := range clients {
-		h.stopClient(client, notice, deadline)
+	for _, client := range job.clients {
+		h.stopClient(client, job.notice, deadline)
 	}
 	return err == nil
 }
 
-// Returns the user excluded from fanout and whether this event can be sent.
-// The target receives its best-effort notice only through stopClient; later
-// registrations must not receive an old frontend removal notification.
-func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) (string, bool) {
+// Returns the target and whether this is a removal frame. An empty target on
+// a removal frame means its payload is invalid and the frame must be dropped.
+func parseMemberRemoval(workspaceID string, raw []byte) (string, bool) {
 	if !memberRemovalCandidate(raw) {
-		return "", true
+		return "", false
 	}
 	var frame struct {
 		Type    string `json:"type"`
@@ -118,12 +110,12 @@ func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) (string, bool) 
 		} `json:"payload"`
 	}
 	if json.Unmarshal(raw, &frame) != nil || frame.Type != "member:removed" {
-		return "", true
-	}
-	if frame.Payload.UserID == "" || frame.Payload.WorkspaceID != workspaceID {
 		return "", false
 	}
-	return frame.Payload.UserID, h.disconnectMember(workspaceID, frame.Payload.UserID, raw)
+	if frame.Payload.UserID == "" || frame.Payload.WorkspaceID != workspaceID {
+		return "", true
+	}
+	return frame.Payload.UserID, true
 }
 
 func memberRemovalCandidate(raw []byte) bool {

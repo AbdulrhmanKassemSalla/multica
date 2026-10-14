@@ -198,6 +198,7 @@ func TestMembershipRemovalReplayAfterRejoin(t *testing.T) {
 	conn := membershipConn(t, membershipServer(t, hub, mc), testUserID, testWorkspaceID)
 	removed := `{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`
 	deliverEnvelope(hub, nil, nil, envelope{Scope: ScopeWorkspace, ScopeID: testWorkspaceID, PayloadJSON: removed})
+	waitFor(t, "stale removal to be checked", func() bool { return hub.memberRemovalPending.Load() == 0 })
 	hub.BroadcastToWorkspace(testWorkspaceID, []byte(`{"type":"issue:updated"}`))
 	// Neither a hard close nor a stale frontend removal notification is valid
 	// when the primary database says the user has rejoined.
@@ -391,6 +392,7 @@ func TestMembershipRemovalLookupDoesNotAffectLaterRejoin(t *testing.T) {
 	t.Cleanup(func() { hub.removeClient(current) })
 	close(release)
 	<-done
+	waitFor(t, "removal lookup and fanout", func() bool { return hub.memberRemovalPending.Load() == 0 })
 	if !old.stopped.Load() || current.stopped.Load() || totalClients(hub) != 2 {
 		t.Fatal("removal result affected a connection registered after its snapshot")
 	}
@@ -423,28 +425,21 @@ func TestMembershipRemovalCandidateFilter(t *testing.T) {
 		name     string
 		raw      string
 		excluded string
-		forward  bool
-		queries  int32
+		removal  bool
 	}{
-		{"ordinary event", `{"type":"issue:updated"}`, "", true, 0},
-		{"marker in content", `{"type":"comment:created","payload":{"body":"member:removed"}}`, "", true, 0},
-		{"removal", `{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
-		{"escaped type", `{"type":"member:\u0072emoved","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
-		{"escaped prefix", `{"type":"m\u0065mber:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
-		{"fully escaped prefix", `{"type":"\u006d\u0065\u006d\u0062\u0065\u0072:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
-		{"wrong workspace", `{"type":"member:removed","payload":{"workspace_id":"other-workspace","user_id":"test-user"}}`, "", false, 0},
-		{"missing user", `{"type":"member:removed","payload":{"workspace_id":"test-workspace"}}`, "", false, 0},
+		{"ordinary event", `{"type":"issue:updated"}`, "", false},
+		{"marker in content", `{"type":"comment:created","payload":{"body":"member:removed"}}`, "", false},
+		{"removal", `{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true},
+		{"escaped type", `{"type":"member:\u0072emoved","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true},
+		{"escaped prefix", `{"type":"m\u0065mber:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true},
+		{"fully escaped prefix", `{"type":"\u006d\u0065\u006d\u0062\u0065\u0072:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true},
+		{"wrong workspace", `{"type":"member:removed","payload":{"workspace_id":"other-workspace","user_id":"test-user"}}`, "", true},
+		{"missing user", `{"type":"member:removed","payload":{"workspace_id":"test-workspace"}}`, "", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			hub := NewHub()
-			var queries atomic.Int32
-			hub.SetMembershipChecker(membershipFunc(func(context.Context, string, string) (bool, error) {
-				queries.Add(1)
-				return false, nil
-			}))
-			excluded, forward := hub.applyMemberRemoval(testWorkspaceID, []byte(tt.raw))
-			if excluded != tt.excluded || forward != tt.forward || queries.Load() != tt.queries {
-				t.Fatalf("got excluded=%q forward=%v queries=%d, want %q %v %d", excluded, forward, queries.Load(), tt.excluded, tt.forward, tt.queries)
+			excluded, removal := parseMemberRemoval(testWorkspaceID, []byte(tt.raw))
+			if excluded != tt.excluded || removal != tt.removal {
+				t.Fatalf("got target=%q removal=%v, want %q %v", excluded, removal, tt.excluded, tt.removal)
 			}
 		})
 	}
@@ -600,9 +595,12 @@ func TestMembershipWriteCohortDoesNotJoinInflightLookup(t *testing.T) {
 	<-entered
 	revoked.Store(true)
 	go func() { second <- hub.authorizeWrites(identity) }()
-	waitFor(t, "later write request to queue separately", func() bool { return len(hub.writeMembership) == 1 })
+	if <-second {
+		close(release)
+		t.Fatal("post-revocation content joined an in-flight membership snapshot")
+	}
 	close(release)
-	if !<-first || <-second || calls.Load() != 2 {
+	if !<-first || calls.Load() != 2 {
 		t.Fatal("post-revocation content reused an in-flight membership snapshot")
 	}
 }
