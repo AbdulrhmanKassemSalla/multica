@@ -107,9 +107,7 @@ func (h *Hub) disconnectMember(workspaceID, userID string, notice []byte) bool {
 // The target receives its best-effort notice only through stopClient; later
 // registrations must not receive an old frontend removal notification.
 func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) (string, bool) {
-	// Ordinary events avoid JSON decoding. Keep support for escaped type
-	// strings, which JSON permits even though our producers emit plain ASCII.
-	if !bytes.Contains(raw, []byte("member:removed")) && !bytes.Contains(raw, []byte(`\u`)) {
+	if !memberRemovalCandidate(raw) {
 		return "", true
 	}
 	var frame struct {
@@ -126,6 +124,13 @@ func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) (string, bool) 
 		return "", false
 	}
 	return frame.Payload.UserID, h.disconnectMember(workspaceID, frame.Payload.UserID, raw)
+}
+
+func memberRemovalCandidate(raw []byte) bool {
+	// An escaped "member" prefix must contain \u006* (m/e/b) or \u0072
+	// (r). HTML and line-separator escapes in ordinary content do not qualify.
+	return bytes.Contains(raw, []byte("member")) ||
+		bytes.Contains(raw, []byte(`\u006`)) || bytes.Contains(raw, []byte(`\u0072`))
 }
 
 func (h *Hub) stopClient(client *Client, notice []byte, deadline time.Time) {

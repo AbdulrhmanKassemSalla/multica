@@ -430,6 +430,8 @@ func TestMembershipRemovalCandidateFilter(t *testing.T) {
 		{"marker in content", `{"type":"comment:created","payload":{"body":"member:removed"}}`, "", true, 0},
 		{"removal", `{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
 		{"escaped type", `{"type":"member:\u0072emoved","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
+		{"escaped prefix", `{"type":"m\u0065mber:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
+		{"fully escaped prefix", `{"type":"\u006d\u0065\u006d\u0062\u0065\u0072:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
 		{"wrong workspace", `{"type":"member:removed","payload":{"workspace_id":"other-workspace","user_id":"test-user"}}`, "", false, 0},
 		{"missing user", `{"type":"member:removed","payload":{"workspace_id":"test-workspace"}}`, "", false, 0},
 	} {
@@ -445,6 +447,19 @@ func TestMembershipRemovalCandidateFilter(t *testing.T) {
 				t.Fatalf("got excluded=%q forward=%v queries=%d, want %q %v %d", excluded, forward, queries.Load(), tt.excluded, tt.forward, tt.queries)
 			}
 		})
+	}
+}
+
+func TestMembershipRemovalPrefilterSkipsEscapedCommentContent(t *testing.T) {
+	raw, err := json.Marshal(map[string]any{
+		"type":    "comment:created",
+		"payload": map[string]string{"body": "Markdown: `<div>x > y && y < z</div>`\u2028\u2029"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if memberRemovalCandidate(raw) {
+		t.Fatalf("HTML and line-separator escapes made an ordinary comment a removal candidate: %s", raw)
 	}
 }
 
