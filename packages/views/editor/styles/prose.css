@@ -38,6 +38,16 @@
   overflow-wrap: break-word;
 }
 
+/* Bidirectional text (Arabic, Hebrew, Persian mixed with English). Each block
+   takes its base direction from its own first strong character instead of the
+   page, so an Arabic paragraph is right-aligned and keeps English words, paths
+   and numbers in the right order, while English blocks stay left-aligned.
+   `start` follows the resolved direction, so LTR-only content is unchanged. */
+.rich-text-editor :is(p, li, h1, h2, h3, h4, h5, h6, blockquote) {
+  unicode-bidi: plaintext;
+  text-align: start;
+}
+
 /* Headings — compact but with clear visual hierarchy */
 .rich-text-editor h1 {
   font-size: var(--text-display-sm);
