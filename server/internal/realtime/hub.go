@@ -22,7 +22,13 @@ import (
 
 // MembershipChecker verifies a user belongs to a workspace.
 type MembershipChecker interface {
-	IsMember(ctx context.Context, userID, workspaceID string) bool
+	IsMember(ctx context.Context, userID, workspaceID string) (bool, error)
+	Members(ctx context.Context, identities []MembershipIdentity) (map[MembershipIdentity]bool, error)
+}
+
+type MembershipIdentity struct {
+	WorkspaceID string
+	UserID      string
 }
 
 // SlugResolver translates a workspace slug to its UUID.
@@ -226,6 +232,9 @@ type Client struct {
 	send        chan []byte
 	userID      string
 	workspaceID string
+	membership  MembershipChecker
+	writeMu     sync.Mutex // serializes application writes and the final removal notice
+	stopped     atomic.Bool
 
 	// sendMu guards sendClosed so a late inbound-response or fanout send
 	// can never write to the closed send channel. closeSend flips
@@ -281,12 +290,16 @@ type SubscriptionCallback func(scopeType, scopeID string)
 
 // Hub manages WebSocket connections organized into scope-based rooms.
 type Hub struct {
-	rooms      map[scopeKey]map[*Client]bool
-	clients    map[*Client]bool // every connected client (used by global Broadcast and snapshots)
-	broadcast  chan []byte
-	register   chan *Client
-	unregister chan *Client
-	mu         sync.RWMutex
+	rooms               map[scopeKey]map[*Client]bool
+	clients             map[*Client]bool // every connected client (used by global Broadcast and snapshots)
+	broadcast           chan []byte
+	register            chan *Client
+	unregister          chan *Client
+	mu                  sync.RWMutex
+	memberMu            sync.Mutex        // serializes membership revalidation/registration with revocation
+	membership          MembershipChecker // guarded by mu
+	writeMembership     chan membershipWriteRequest
+	writeMembershipOnce sync.Once
 
 	authorizer ScopeAuthorizer
 
@@ -298,11 +311,12 @@ type Hub struct {
 // NewHub creates a new Hub instance.
 func NewHub() *Hub {
 	return &Hub{
-		rooms:      make(map[scopeKey]map[*Client]bool),
-		clients:    make(map[*Client]bool),
-		broadcast:  make(chan []byte),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		rooms:           make(map[scopeKey]map[*Client]bool),
+		clients:         make(map[*Client]bool),
+		broadcast:       make(chan []byte),
+		register:        make(chan *Client),
+		unregister:      make(chan *Client),
+		writeMembership: make(chan membershipWriteRequest, maxMembershipBatch),
 	}
 }
 
@@ -328,18 +342,7 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
-			h.mu.Lock()
-			h.clients[client] = true
-			total := len(h.clients)
-			h.mu.Unlock()
-			M.ConnectsTotal.Add(1)
-			M.ActiveConnections.Add(1)
-			// Auto-subscribe to the workspace and user scopes.
-			h.subscribe(client, ScopeWorkspace, client.workspaceID)
-			if client.userID != "" {
-				h.subscribe(client, ScopeUser, client.userID)
-			}
-			slog.Info("ws client connected", "workspace_id", client.workspaceID, "user_id", client.userID, "total_clients", total)
+			h.registerClient(client)
 
 		case client := <-h.unregister:
 			h.removeClient(client)
@@ -505,6 +508,11 @@ func (h *Hub) BroadcastToScopeDedup(scopeType, scopeID string, message []byte, e
 	if scopeType == "" || scopeID == "" {
 		return
 	}
+	// Both the local fast path and every relay backend converge here. A
+	// replayed removal is meaningful only while the user is still absent.
+	if scopeType == ScopeWorkspace && !h.applyMemberRemoval(scopeID, message) {
+		return
+	}
 	key := sk(scopeType, scopeID)
 
 	h.mu.RLock()
@@ -601,10 +609,9 @@ func (h *Hub) fanoutUser(userID string, message []byte, excludeWorkspace, eventI
 		if !client.markSeen(eventID) {
 			continue
 		}
-		select {
-		case client.send <- message:
+		if client.trySend(message) {
 			sent++
-		default:
+		} else {
 			slow = append(slow, client)
 		}
 	}
@@ -804,7 +811,12 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			http.Error(w, errMsg, status)
 			return
 		}
-		if !mc.IsMember(r.Context(), uid, workspaceID) {
+		member, lookupErr := checkMembership(mc, uid, workspaceID)
+		if lookupErr != nil {
+			http.Error(w, `{"error":"membership lookup failed"}`, http.StatusServiceUnavailable)
+			return
+		}
+		if !member {
 			http.Error(w, `{"error":"not a member of this workspace"}`, http.StatusForbidden)
 			return
 		}
@@ -836,7 +848,12 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 			writeWSAuthErrorAndClose(conn, []byte(errMsg), "workspace_id", workspaceID)
 			return
 		}
-		if !mc.IsMember(r.Context(), uid, workspaceID) {
+		member, lookupErr := checkMembership(mc, uid, workspaceID)
+		if lookupErr != nil {
+			writeWSAuthErrorAndClose(conn, []byte(`{"error":"membership lookup failed"}`), "workspace_id", workspaceID)
+			return
+		}
+		if !member {
 			writeWSAuthErrorAndClose(
 				conn,
 				[]byte(`{"error":"not a member of this workspace"}`),
@@ -880,6 +897,7 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 		send:        make(chan []byte, 256),
 		userID:      userID,
 		workspaceID: workspaceID,
+		membership:  mc,
 	}
 	hub.register <- client
 
@@ -1082,18 +1100,28 @@ func (c *Client) writePump() {
 	for {
 		select {
 		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
 			if !ok {
-				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				c.writeMu.Lock()
+				if !c.stopped.Load() {
+					c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+					c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				}
+				c.writeMu.Unlock()
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
-				slog.Warn("websocket write error", "error", err, "user_id", c.userID, "workspace_id", c.workspaceID)
+			if !c.writeBatch(message) {
 				return
 			}
 		case <-ticker.C:
+			c.writeMu.Lock()
+			if c.stopped.Load() {
+				c.writeMu.Unlock()
+				return
+			}
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			err := c.conn.WriteMessage(websocket.PingMessage, nil)
+			c.writeMu.Unlock()
+			if err != nil {
 				return
 			}
 		}
