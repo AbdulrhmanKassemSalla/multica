@@ -232,7 +232,6 @@ type Client struct {
 	send        chan []byte
 	userID      string
 	workspaceID string
-	membership  MembershipChecker
 	writeMu     sync.Mutex // serializes application writes and the final removal notice
 	stopped     atomic.Bool
 
@@ -296,7 +295,6 @@ type Hub struct {
 	register            chan *Client
 	unregister          chan *Client
 	mu                  sync.RWMutex
-	memberMu            sync.Mutex        // serializes membership revalidation/registration with revocation
 	membership          MembershipChecker // guarded by mu
 	writeMembership     chan membershipWriteRequest
 	writeMembershipOnce sync.Once
@@ -510,8 +508,13 @@ func (h *Hub) BroadcastToScopeDedup(scopeType, scopeID string, message []byte, e
 	}
 	// Both the local fast path and every relay backend converge here. A
 	// replayed removal is meaningful only while the user is still absent.
-	if scopeType == ScopeWorkspace && !h.applyMemberRemoval(scopeID, message) {
-		return
+	var excludeUserID string
+	if scopeType == ScopeWorkspace {
+		var forward bool
+		excludeUserID, forward = h.applyMemberRemoval(scopeID, message)
+		if !forward {
+			return
+		}
 	}
 	key := sk(scopeType, scopeID)
 
@@ -520,6 +523,9 @@ func (h *Hub) BroadcastToScopeDedup(scopeType, scopeID string, message []byte, e
 	var slow []*Client
 	var sent int64
 	for client := range clients {
+		if excludeUserID != "" && client.userID == excludeUserID {
+			continue
+		}
 		if !client.markSeen(eventID) {
 			continue
 		}
@@ -897,7 +903,6 @@ func HandleWebSocket(hub *Hub, mc MembershipChecker, pr PATResolver, resolveSlug
 		send:        make(chan []byte, 256),
 		userID:      userID,
 		workspaceID: workspaceID,
-		membership:  mc,
 	}
 	hub.register <- client
 

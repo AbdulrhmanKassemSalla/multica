@@ -1,6 +1,7 @@
 package realtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,7 @@ const (
 )
 
 // SetMembershipChecker wires the primary database lookup before serving sockets.
-// The handshake and registration must use this same authority.
+// The handshake and content writer must use this same authority.
 func (h *Hub) SetMembershipChecker(checker MembershipChecker) {
 	h.mu.Lock()
 	h.membership = checker
@@ -38,16 +39,11 @@ func checkMembership(checker MembershipChecker, userID, workspaceID string) (boo
 }
 
 func (h *Hub) registerClient(client *Client) {
-	h.memberMu.Lock()
-	defer h.memberMu.Unlock()
-	member, err := checkMembership(client.membership, client.userID, client.workspaceID)
-	if err != nil || !member {
-		h.stopClient(client, nil, time.Time{})
-		return
-	}
+	// Keep the Hub event loop free of database waits. A connection whose
+	// handshake raced revocation is denied by its first content write.
 	h.mu.Lock()
-	// A transport/write failure can abort this client while the database
-	// lookup is in flight. Check under the same lock used by removeClient.
+	// A transport/write failure can abort this client before registration.
+	// Check under the same lock used by removeClient.
 	if client.stopped.Load() {
 		h.mu.Unlock()
 		return
@@ -63,35 +59,23 @@ func (h *Hub) registerClient(client *Client) {
 }
 
 // DisconnectMember is a post-commit signal, not an authorization cache. Check
-// current membership under the registration lock so delayed/replayed signals
-// cannot disconnect a newly rejoined member. Lookup errors fail closed without
-// claiming to the client that its membership has been removed.
+// current membership so delayed/replayed signals cannot disconnect a rejoined
+// member. Lookup errors fail closed without claiming membership was removed.
 func (h *Hub) DisconnectMember(workspaceID, userID, memberID string) {
 	if h == nil || workspaceID == "" || userID == "" {
 		return
 	}
-	h.memberMu.Lock()
-	defer h.memberMu.Unlock()
 	notice, _ := json.Marshal(map[string]any{
 		"type":    "member:removed",
 		"payload": map[string]string{"workspace_id": workspaceID, "user_id": userID, "member_id": memberID},
 	})
-	h.disconnectMemberLocked(workspaceID, userID, notice)
+	h.disconnectMember(workspaceID, userID, notice)
 }
 
 // Returns false when a removal notification is stale or cannot be verified.
-func (h *Hub) disconnectMemberLocked(workspaceID, userID string, notice []byte) bool {
+func (h *Hub) disconnectMember(workspaceID, userID string, notice []byte) bool {
 	h.mu.RLock()
 	checker := h.membership
-	h.mu.RUnlock()
-	member, err := checkMembership(checker, userID, workspaceID)
-	if err == nil && member {
-		return false
-	}
-	if err != nil {
-		notice = nil
-	}
-	h.mu.RLock()
 	var clients []*Client
 	for client := range h.clients {
 		if client.workspaceID == workspaceID && client.userID == userID {
@@ -99,6 +83,16 @@ func (h *Hub) disconnectMemberLocked(workspaceID, userID string, notice []byte) 
 		}
 	}
 	h.mu.RUnlock()
+	// Close the connection snapshot before querying membership. A new
+	// connection registered during the lookup must not inherit its old result;
+	// its own writer will check current membership before sending content.
+	member, err := checkMembership(checker, userID, workspaceID)
+	if err == nil && member {
+		return false
+	}
+	if err != nil {
+		notice = nil
+	}
 	// One total deadline bounds notification attempts across all sockets. An
 	// idle writer can send the existing client navigation signal; busy/slow
 	// writers are closed immediately instead of draining content first.
@@ -109,7 +103,15 @@ func (h *Hub) disconnectMemberLocked(workspaceID, userID string, notice []byte) 
 	return err == nil
 }
 
-func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) bool {
+// Returns the user excluded from fanout and whether this event can be sent.
+// The target receives its best-effort notice only through stopClient; later
+// registrations must not receive an old frontend removal notification.
+func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) (string, bool) {
+	// Ordinary events avoid JSON decoding. Keep support for escaped type
+	// strings, which JSON permits even though our producers emit plain ASCII.
+	if !bytes.Contains(raw, []byte("member:removed")) && !bytes.Contains(raw, []byte(`\u`)) {
+		return "", true
+	}
 	var frame struct {
 		Type    string `json:"type"`
 		Payload struct {
@@ -118,20 +120,18 @@ func (h *Hub) applyMemberRemoval(workspaceID string, raw []byte) bool {
 		} `json:"payload"`
 	}
 	if json.Unmarshal(raw, &frame) != nil || frame.Type != "member:removed" {
-		return true
+		return "", true
 	}
 	if frame.Payload.UserID == "" || frame.Payload.WorkspaceID != workspaceID {
-		return false
+		return "", false
 	}
-	h.memberMu.Lock()
-	defer h.memberMu.Unlock()
-	return h.disconnectMemberLocked(workspaceID, frame.Payload.UserID, raw)
+	return frame.Payload.UserID, h.disconnectMember(workspaceID, frame.Payload.UserID, raw)
 }
 
 func (h *Hub) stopClient(client *Client, notice []byte, deadline time.Time) {
 	client.stopped.Store(true)
 	h.removeClient(client)
-	client.closeSend() // registration can be rejected before joining h.clients
+	client.closeSend() // a writer may stop before registration completes
 	for range client.send {
 		// Discard queued content, including frames whose writer is doing a
 		// membership lookup concurrently. The writer also checks stopped.

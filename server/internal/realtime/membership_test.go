@@ -216,7 +216,47 @@ func TestMembershipReplayCannotRestoreRevokedAccess(t *testing.T) {
 	wantMembershipClosed(t, conn)
 }
 
-func TestMembershipRegistrationRejectsStaleHandshake(t *testing.T) {
+func TestMembershipRegistrationDoesNotQueryDatabase(t *testing.T) {
+	hub := NewHub()
+	var queries atomic.Int32
+	checker := membershipFunc(func(context.Context, string, string) (bool, error) {
+		queries.Add(1)
+		return false, errors.New("database unavailable")
+	})
+	hub.SetMembershipChecker(checker)
+	go hub.Run()
+	clients := make([]*Client, 20)
+	for i := range clients {
+		clients[i] = &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+		hub.register <- clients[i]
+		t.Cleanup(func() { hub.removeClient(clients[i]) })
+	}
+	// A later event is a barrier for all registrations in the single loop.
+	hub.unregister <- &Client{}
+	if queries.Load() != 0 {
+		t.Fatalf("registration issued %d database queries in the Hub event loop", queries.Load())
+	}
+	if totalClients(hub) != len(clients) {
+		t.Fatal("database availability affected in-memory registration")
+	}
+	hub.unregister <- clients[0]
+	hub.Broadcast([]byte(`{"type":"hub-progress"}`))
+	if _, open := <-clients[0].send; open {
+		t.Fatal("event loop did not clean up the disconnected client")
+	}
+	for _, client := range clients[1:] {
+		select {
+		case frame := <-client.send:
+			if string(frame) != `{"type":"hub-progress"}` {
+				t.Fatalf("unexpected broadcast: %s", frame)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("event loop did not deliver the global broadcast")
+		}
+	}
+}
+
+func TestMembershipStaleHandshakeCannotReceiveContent(t *testing.T) {
 	hub := NewHub()
 	var checks atomic.Int32
 	mc := membershipFunc(func(context.Context, string, string) (bool, error) {
@@ -227,52 +267,191 @@ func TestMembershipRegistrationRejectsStaleHandshake(t *testing.T) {
 	server := membershipServer(t, hub, mc)
 	conn := connectWS(t, server)
 	defer conn.Close()
+	waitFor(t, "stale handshake registration", func() bool { return totalClients(hub) == 1 })
+	if checks.Load() != 1 {
+		t.Fatal("registration rechecked membership instead of leaving it to the writer")
+	}
+	hub.BroadcastToWorkspace(testWorkspaceID, []byte(`{"type":"comment:created","payload":{"body":"after-revocation"}}`))
 	wantMembershipClosed(t, conn)
+	waitFor(t, "revoked connection cleanup", func() bool { return totalClients(hub) == 0 })
 	if totalClients(hub) != 0 || hub.HasLocalSubscribers(ScopeWorkspace, testWorkspaceID) {
 		t.Fatal("stale handshake left a registered connection")
 	}
 }
 
-func TestMembershipRegistrationSerializedWithRemoval(t *testing.T) {
+func TestMembershipRegistrationAfterRemovalCannotReceiveContent(t *testing.T) {
+	conn, peer := membershipSocketPair(t)
 	hub := NewHub()
-	var revoked atomic.Bool
-	entered, release := make(chan struct{}), make(chan struct{})
 	checker := membershipFunc(func(context.Context, string, string) (bool, error) {
-		return !revoked.Load(), nil
+		return false, nil
 	})
 	hub.SetMembershipChecker(checker)
-	client := &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
-	client.membership = membershipFunc(func(context.Context, string, string) (bool, error) {
-		member := !revoked.Load()
+	// The handshake passed earlier, but registration reached this node after
+	// revocation already took its connection snapshot and completed.
+	hub.DisconnectMember(testWorkspaceID, testUserID, "member-id")
+	client := &Client{hub: hub, conn: conn, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+	hub.registerClient(client)
+	if totalClients(hub) != 1 {
+		t.Fatal("connection was not registered in memory")
+	}
+	if client.writeBatch([]byte(`{"type":"after-revocation"}`)) {
+		t.Fatal("late registration received content after revocation")
+	}
+	wantMembershipClosed(t, peer)
+	if totalClients(hub) != 0 || hub.HasLocalSubscribers(ScopeWorkspace, testWorkspaceID) || !client.stopped.Load() {
+		t.Fatal("write-time denial left a registered connection")
+	}
+}
+
+func TestMembershipRegistrationProgressDuringRemovalLookup(t *testing.T) {
+	hub := NewHub()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var queries atomic.Int32
+	hub.SetMembershipChecker(membershipFunc(func(context.Context, string, string) (bool, error) {
+		if queries.Add(1) == 1 {
+			close(entered)
+		}
+		<-release
+		return false, nil
+	}))
+	old := &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+	hub.registerClient(old)
+	go hub.Run()
+	removed := make(chan struct{})
+	go func() { hub.DisconnectMember(testWorkspaceID, testUserID, "member-id"); close(removed) }()
+	<-entered
+	clients := make([]*Client, 20)
+	progress := make(chan struct{})
+	go func() {
+		for i := range clients {
+			clients[i] = &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+			hub.register <- clients[i]
+		}
+		hub.unregister <- clients[0]
+		hub.Broadcast([]byte(`{"type":"hub-progress"}`))
+		close(progress)
+	}()
+	t.Cleanup(func() {
+		close(release)
+		<-removed
+		<-progress
+		for _, client := range clients {
+			hub.removeClient(client)
+		}
+	})
+	// The lookup remains blocked until cleanup; completion cannot depend on
+	// its latency or on database availability.
+	select {
+	case <-progress:
+	case <-time.After(2 * time.Second):
+		t.Fatal("removal lookup blocked registration, cleanup or global broadcast")
+	}
+	if queries.Load() != 1 {
+		t.Fatal("registrations issued extra membership lookups")
+	}
+	if _, open := <-clients[0].send; open {
+		t.Fatal("disconnected client was not cleaned up while the lookup was blocked")
+	}
+	for _, client := range clients[1:] {
+		select {
+		case frame := <-client.send:
+			if string(frame) != `{"type":"hub-progress"}` {
+				t.Fatalf("unexpected broadcast: %s", frame)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("broadcast did not progress while the lookup was blocked")
+		}
+	}
+}
+
+func TestMembershipRemovalLookupDoesNotAffectLaterRejoin(t *testing.T) {
+	hub := NewHub()
+	old := &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+	other := &Client{hub: hub, userID: "current-user", workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+	hub.registerClient(old)
+	hub.registerClient(other)
+	t.Cleanup(func() { hub.removeClient(other) })
+	entered, release := make(chan struct{}), make(chan struct{})
+	var rejoined atomic.Bool
+	hub.SetMembershipChecker(membershipFunc(func(context.Context, string, string) (bool, error) {
+		member := rejoined.Load()
 		close(entered)
 		<-release
 		return member, nil
-	})
-	registered, disconnected := make(chan struct{}), make(chan struct{})
-	go func() { hub.registerClient(client); close(registered) }()
+	}))
+	removed := []byte(`{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`)
+	done := make(chan struct{})
+	go func() { hub.BroadcastToWorkspace(testWorkspaceID, removed); close(done) }()
 	<-entered
-	revoked.Store(true)
-	go func() { hub.DisconnectMember(testWorkspaceID, testUserID, "member-id"); close(disconnected) }()
+	// The database now has a fresh membership, while the removal query still
+	// holds the old absence snapshot. Its result must apply only to old.
+	rejoined.Store(true)
+	current := &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
+	hub.registerClient(current)
+	t.Cleanup(func() { hub.removeClient(current) })
 	close(release)
-	for _, done := range []chan struct{}{registered, disconnected} {
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("membership operation did not complete")
-		}
+	<-done
+	if !old.stopped.Load() || current.stopped.Load() || totalClients(hub) != 2 {
+		t.Fatal("removal result affected a connection registered after its snapshot")
 	}
-	if totalClients(hub) != 0 || hub.HasLocalSubscribers(ScopeWorkspace, testWorkspaceID) || !client.stopped.Load() {
-		t.Fatal("revocation raced past registration")
+	select {
+	case frame := <-other.send:
+		if string(frame) != string(removed) {
+			t.Fatalf("remaining member missed removal notification: %s", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("remaining member missed removal notification")
+	}
+	select {
+	case frame := <-current.send:
+		t.Fatalf("rejoined member received an old frontend removal notification: %s", frame)
+	default:
+	}
+	hub.BroadcastToWorkspace(testWorkspaceID, []byte(`{"type":"issue:updated"}`))
+	select {
+	case frame := <-current.send:
+		if string(frame) != `{"type":"issue:updated"}` {
+			t.Fatalf("rejoined connection could not receive new updates: %s", frame)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("rejoined connection could not receive new updates")
+	}
+}
+
+func TestMembershipRemovalCandidateFilter(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		raw      string
+		excluded string
+		forward  bool
+		queries  int32
+	}{
+		{"ordinary event", `{"type":"issue:updated"}`, "", true, 0},
+		{"marker in content", `{"type":"comment:created","payload":{"body":"member:removed"}}`, "", true, 0},
+		{"removal", `{"type":"member:removed","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
+		{"escaped type", `{"type":"member:\u0072emoved","payload":{"workspace_id":"test-workspace","user_id":"test-user"}}`, testUserID, true, 1},
+		{"wrong workspace", `{"type":"member:removed","payload":{"workspace_id":"other-workspace","user_id":"test-user"}}`, "", false, 0},
+		{"missing user", `{"type":"member:removed","payload":{"workspace_id":"test-workspace"}}`, "", false, 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			hub := NewHub()
+			var queries atomic.Int32
+			hub.SetMembershipChecker(membershipFunc(func(context.Context, string, string) (bool, error) {
+				queries.Add(1)
+				return false, nil
+			}))
+			excluded, forward := hub.applyMemberRemoval(testWorkspaceID, []byte(tt.raw))
+			if excluded != tt.excluded || forward != tt.forward || queries.Load() != tt.queries {
+				t.Fatalf("got excluded=%q forward=%v queries=%d, want %q %v %d", excluded, forward, queries.Load(), tt.excluded, tt.forward, tt.queries)
+			}
+		})
 	}
 }
 
 func TestMembershipRegistrationDoesNotRestoreStoppedClient(t *testing.T) {
 	hub := NewHub()
 	client := &Client{hub: hub, userID: testUserID, workspaceID: testWorkspaceID, send: make(chan []byte, 2)}
-	client.membership = membershipFunc(func(context.Context, string, string) (bool, error) {
-		hub.stopClient(client, nil, time.Time{})
-		return true, nil
-	})
+	hub.stopClient(client, nil, time.Time{})
 	hub.registerClient(client)
 	if totalClients(hub) != 0 || hub.HasLocalSubscribers(ScopeWorkspace, testWorkspaceID) {
 		t.Fatal("registration restored an already stopped connection")
@@ -314,7 +493,7 @@ func TestMembershipWriteBatchDoesNotCacheAuthorization(t *testing.T) {
 		}
 		return member, nil
 	})
-	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 8), membership: mc, userID: testUserID, workspaceID: testWorkspaceID}
+	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 8), userID: testUserID, workspaceID: testWorkspaceID}
 	hub.SetMembershipChecker(mc)
 	for i := 0; i < 3; i++ {
 		client.send <- []byte(`{"type":"before-revocation"}`)
@@ -347,14 +526,14 @@ func TestMembershipHardCloseDropsCapturedAndQueuedFrames(t *testing.T) {
 	hub.SetMembershipChecker(membershipFunc(func(context.Context, string, string) (bool, error) { return !revoked.Load(), nil }))
 	entered, release := make(chan struct{}), make(chan struct{})
 	client := &Client{hub: hub, conn: conn, send: make(chan []byte, 4), userID: testUserID, workspaceID: testWorkspaceID}
-	client.membership = membershipFunc(func(context.Context, string, string) (bool, error) {
+	batchChecker := membershipFunc(func(context.Context, string, string) (bool, error) {
 		close(entered)
 		<-release
 		return true, nil
 	})
 	hub.SetMembershipChecker(membershipBatchOverride{
 		membershipFunc: membershipFunc(func(context.Context, string, string) (bool, error) { return !revoked.Load(), nil }),
-		batch:          client.membership.Members,
+		batch:          batchChecker.Members,
 	})
 	hub.clients[client] = true
 	hub.subscribe(client, ScopeWorkspace, testWorkspaceID)
