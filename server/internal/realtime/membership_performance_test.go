@@ -137,14 +137,14 @@ func TestMembershipCancelledRequestDoesNotEnterLiveCohort(t *testing.T) {
 
 func TestMembershipQueryUsesRemainingCallerBudget(t *testing.T) {
 	hub := NewHub()
-	caller, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	caller, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	deadline, _ := caller.Deadline()
 	var observed time.Time
 	request := membershipWriteRequest{ctx: caller, identity: MembershipIdentity{UserID: "current"}, result: make(chan bool, 1)}
 	hub.SetMembershipChecker(membershipBatchOverride{batch: func(ctx context.Context, identities []MembershipIdentity) (map[MembershipIdentity]bool, error) {
 		observed, _ = ctx.Deadline()
-		<-ctx.Done()
+		cancel()
 		return map[MembershipIdentity]bool{identities[0]: true}, nil
 	}})
 	hub.writeMembership <- request
